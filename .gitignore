@@ -1,0 +1,10 @@
+.vercel
+.env*.local
+
+.turbo
+.next
+node_modules
+
+next-env.d
+
+dist

@@ -1,0 +1,45 @@
+{
+  "name": "@use-sandbox/core",
+  "version": "0.0.1",
+  "description": "Runtime for 'use sandbox' and 'use exec' directives with Vercel Sandbox",
+  "type": "module",
+  "main": "dist/index.js",
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "Apache-2.0",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./runtime": {
+      "types": "./dist/runtime.d.ts",
+      "default": "./dist/runtime.js"
+    },
+    "./context": {
+      "types": "./dist/context.d.ts",
+      "default": "./dist/context.js"
+    },
+    "./internal/private": {
+      "types": "./dist/internal/private.d.ts",
+      "default": "./dist/internal/private.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@vercel/sandbox": "^1.1.0"
+  },
+  "devDependencies": {
+    "@use-sandbox/tsconfig": "workspace:*",
+    "@types/node": "^22.0.0"
+  }
+}
+

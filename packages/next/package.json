@@ -1,0 +1,40 @@
+{
+  "name": "@use-sandbox/next",
+  "version": "0.0.1",
+  "description": "Next.js integration for 'use sandbox' and 'use exec' directives",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./dist/index.js",
+    "./loader": "./dist/loader.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@use-sandbox/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@use-sandbox/tsconfig": "workspace:*",
+    "@types/node": "^22.0.0",
+    "next": "^15.0.0"
+  },
+  "peerDependencies": {
+    "next": ">13"
+  },
+  "peerDependenciesMeta": {
+    "next": {
+      "optional": true
+    }
+  }
+}
+
