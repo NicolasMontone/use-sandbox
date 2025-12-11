@@ -1,40 +1,116 @@
 /**
  * esbuild-based bundler for sandbox functions.
  *
- * Collects all registered sandbox functions and bundles them into
- * a single JavaScript file that can be loaded in the sandbox runtime.
+ * Reads original source files to extract imports and function definitions,
+ * then bundles everything together with esbuild.
  */
 
-import { build } from "esbuild";
+import { buildSync } from "esbuild";
 import { getRegisteredFunctions, hasRegisteredFunctions } from "./registry";
-import { writeFileSync, mkdirSync, existsSync } from "fs";
+import { writeFileSync, mkdirSync, existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { createHash } from "crypto";
-
 export interface BundleResult {
   bundlePath: string;
   bundleHash: string;
   functionIds: string[];
 }
 
-export async function generateBundle(outputDir: string): Promise<BundleResult | null> {
+// Track the last generated bundle hash to avoid regenerating
+let lastBundleHash: string | null = null;
+
+/**
+ * Generate the sandbox bundle synchronously.
+ * Returns null if no functions are registered or bundle is already up-to-date.
+ */
+export function generateBundleSync(): BundleResult | null {
   if (!hasRegisteredFunctions()) {
     return null;
   }
 
   const functions = getRegisteredFunctions();
 
-  // Generate the entry file content that exports all sandbox functions
-  const entryContent = functions.map((fn) => fn.body).join("\n\n");
+  // We need to handle async extraction, so we'll do it slightly differently
+  // For now, use a simpler approach: read files synchronously and use regex
+  
+  const entryParts: string[] = [];
+  const seenImports = new Set<string>();
 
-  // Create a temporary entry file
-  const tempDir = join(outputDir, ".sandbox-temp");
-  if (!existsSync(tempDir)) {
-    mkdirSync(tempDir, { recursive: true });
+  for (const fn of functions) {
+    const source = readFileSync(fn.sourceFile, "utf-8");
+    
+    // Extract all imports (simple regex approach)
+    const importMatches = source.matchAll(/^import\s+.*?(?:from\s+['"][^'"]+['"])?;?\s*$/gm);
+    for (const match of importMatches) {
+      if (!seenImports.has(match[0])) {
+        seenImports.add(match[0]);
+        entryParts.push(match[0]);
+      }
+    }
   }
 
-  const entryPath = join(tempDir, "sandbox-entry.ts");
-  writeFileSync(entryPath, entryContent);
+  // Add a separator
+  entryParts.push("\n// Sandbox functions\n");
+
+  for (const fn of functions) {
+    const source = readFileSync(fn.sourceFile, "utf-8");
+    
+    // Find the function definition using regex
+    // Match: async function fnName(...) { ... }
+    // This is a simplified approach - handles common cases
+    const fnRegex = new RegExp(
+      `(async\\s+)?function\\s+${fn.fnName}\\s*\\([^)]*\\)\\s*(?::\\s*[^{]+)?\\s*\\{`,
+      "g"
+    );
+    
+    const match = fnRegex.exec(source);
+    if (match) {
+      // Find the matching closing brace
+      const startIndex = match.index;
+      let braceCount = 0;
+      let endIndex = startIndex;
+      let inString = false;
+      let stringChar = "";
+      
+      for (let i = startIndex; i < source.length; i++) {
+        const char = source[i];
+        const prevChar = i > 0 ? source[i - 1] : "";
+        
+        // Handle strings
+        if ((char === '"' || char === "'" || char === "`") && prevChar !== "\\") {
+          if (!inString) {
+            inString = true;
+            stringChar = char;
+          } else if (char === stringChar) {
+            inString = false;
+          }
+        }
+        
+        if (!inString) {
+          if (char === "{") braceCount++;
+          if (char === "}") {
+            braceCount--;
+            if (braceCount === 0) {
+              endIndex = i + 1;
+              break;
+            }
+          }
+        }
+      }
+      
+      let fnCode = source.slice(startIndex, endIndex);
+      
+      // Rename and export
+      fnCode = fnCode.replace(
+        new RegExp(`(async\\s+)?function\\s+${fn.fnName}`),
+        `export $1function ${fn.fnId}`
+      );
+      
+      entryParts.push(fnCode);
+    }
+  }
+
+  const entryContent = entryParts.join("\n\n");
 
   // Generate hash for cache busting
   const bundleHash = createHash("sha256")
@@ -42,8 +118,25 @@ export async function generateBundle(outputDir: string): Promise<BundleResult | 
     .digest("hex")
     .slice(0, 16);
 
+  // Skip if bundle is already up-to-date
+  if (lastBundleHash === bundleHash) {
+    return null;
+  }
+
+  // Always write to a predictable location relative to cwd
+  const projectRoot = process.cwd();
+  const sandboxDir = join(projectRoot, ".next/static/sandbox");
+
+  // Create a temporary entry file
+  const tempDir = join(projectRoot, ".next/.sandbox-temp");
+  if (!existsSync(tempDir)) {
+    mkdirSync(tempDir, { recursive: true });
+  }
+
+  const entryPath = join(tempDir, "sandbox-entry.ts");
+  writeFileSync(entryPath, entryContent);
+
   // Ensure output directory exists
-  const sandboxDir = join(outputDir, "static", "sandbox");
   if (!existsSync(sandboxDir)) {
     mkdirSync(sandboxDir, { recursive: true });
   }
@@ -51,8 +144,8 @@ export async function generateBundle(outputDir: string): Promise<BundleResult | 
   const bundleFilename = `bundle-${bundleHash}.js`;
   const bundlePath = join(sandboxDir, bundleFilename);
 
-  // Bundle with esbuild
-  await build({
+  // Bundle with esbuild (synchronous)
+  buildSync({
     entryPoints: [entryPath],
     bundle: true,
     format: "esm",
@@ -61,8 +154,9 @@ export async function generateBundle(outputDir: string): Promise<BundleResult | 
     outfile: bundlePath,
     minify: false, // Keep readable for debugging
     treeShaking: true,
-    // Don't bundle node built-ins
+    // External: node builtins + frameworks that shouldn't be in sandbox
     external: [
+      // Node.js built-ins
       "fs",
       "fs/promises",
       "path",
@@ -81,6 +175,15 @@ export async function generateBundle(outputDir: string): Promise<BundleResult | 
       "net",
       "tls",
       "dns",
+      "assert",
+      "worker_threads",
+      "cluster",
+      // Frameworks (shouldn't be in sandbox)
+      "next",
+      "next/*",
+      "react",
+      "react-dom",
+      "react/*",
     ],
   });
 
@@ -90,12 +193,16 @@ export async function generateBundle(outputDir: string): Promise<BundleResult | 
     bundleFile: bundleFilename,
     functions: functions.map((fn) => ({
       id: fn.fnId,
+      originalName: fn.fnName,
       sourceFile: fn.sourceFile,
     })),
   };
 
   const manifestPath = join(sandboxDir, "manifest.json");
   writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+
+  // Remember the hash to avoid regenerating
+  lastBundleHash = bundleHash;
 
   return {
     bundlePath,
@@ -104,21 +211,10 @@ export async function generateBundle(outputDir: string): Promise<BundleResult | 
   };
 }
 
-export function getBundleUrl(bundleHash: string): string {
-  // Determine the base URL based on Vercel environment
-  const baseUrl = getBaseUrl();
-  return `${baseUrl}/_next/static/sandbox/bundle-${bundleHash}.js`;
+/**
+ * Async version for compatibility.
+ * @deprecated Use generateBundleSync instead
+ */
+export async function generateBundle(_outputDir: string): Promise<BundleResult | null> {
+  return generateBundleSync();
 }
-
-function getBaseUrl(): string {
-  if (process.env.VERCEL_ENV === "production") {
-    return `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`;
-  }
-  if (process.env.VERCEL_ENV === "preview") {
-    return `https://${process.env.VERCEL_BRANCH_URL}`;
-  }
-  // Local development
-  const port = process.env.PORT || "3000";
-  return `http://localhost:${port}`;
-}
-

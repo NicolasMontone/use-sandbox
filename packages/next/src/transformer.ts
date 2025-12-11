@@ -146,10 +146,12 @@ interface HasSpan {
   span: { start: number; end: number };
 }
 
+type ByteToCharFn = (bytePos: number) => number;
+
 function getParamsSource(
   params: (Param | Pattern)[],
   source: string,
-  byteToChar: number[]
+  byteToChar: ByteToCharFn
 ): string {
   if (params.length === 0) return "";
   const first = params[0];
@@ -166,7 +168,7 @@ function getParamsSource(
   const startSpan = getSpan(first);
   const endSpan = getSpan(last);
 
-  return source.slice(byteToChar[startSpan.start], byteToChar[endSpan.end]);
+  return source.slice(byteToChar(startSpan.start), byteToChar(endSpan.end));
 }
 
 interface FunctionInfo {
@@ -180,9 +182,9 @@ interface FunctionInfo {
   endOffset: number;
 }
 
-function extractFunctionInfo(
+function extractFunctionInfoWithOffset(
   stmt: ModuleItem,
-  byteToChar: number[]
+  byteToChar: ByteToCharFn
 ): FunctionInfo | null {
   let fnDecl: FunctionDeclaration | FunctionExpression | null = null;
   let isExport = false;
@@ -209,8 +211,8 @@ function extractFunctionInfo(
         isAsync: fnExpr.async,
         isExport,
         isDefaultExport,
-        startOffset: byteToChar[stmt.span.start],
-        endOffset: byteToChar[stmt.span.end],
+        startOffset: byteToChar(stmt.span.start),
+        endOffset: byteToChar(stmt.span.end),
       };
     }
   }
@@ -228,8 +230,8 @@ function extractFunctionInfo(
     isAsync: fnDecl.async,
     isExport,
     isDefaultExport,
-    startOffset: byteToChar[parentStmt.span.start],
-    endOffset: byteToChar[parentStmt.span.end],
+    startOffset: byteToChar(parentStmt.span.start),
+    endOffset: byteToChar(parentStmt.span.end),
   };
 }
 
@@ -247,7 +249,7 @@ interface ParsedSandboxFunction {
 function parseSandboxFunction(
   fnInfo: FunctionInfo,
   source: string,
-  byteToChar: number[]
+  byteToChar: ByteToCharFn
 ): ParsedSandboxFunction {
   const stmts = fnInfo.body.stmts;
   let configCallSource: string | null = null;
@@ -257,8 +259,8 @@ function parseSandboxFunction(
   if (stmts.length > 1 && isSandboxConfigCall(stmts[1])) {
     const configStmt = stmts[1] as ExpressionStatement;
     configCallSource = source.slice(
-      byteToChar[configStmt.span.start],
-      byteToChar[configStmt.span.end]
+      byteToChar(configStmt.span.start),
+      byteToChar(configStmt.span.end)
     );
     bodyStartIndex = 2;
   }
@@ -268,8 +270,8 @@ function parseSandboxFunction(
     const firstRemaining = stmts[bodyStartIndex];
     const lastStmt = stmts[stmts.length - 1];
     const remainingBodySource = source.slice(
-      byteToChar[firstRemaining.span.start],
-      byteToChar[lastStmt.span.end]
+      byteToChar(firstRemaining.span.start),
+      byteToChar(lastStmt.span.end)
     );
     return { fnInfo, configCallSource, remainingBodySource };
   }
@@ -281,7 +283,7 @@ function generateServerStub(
   parsed: ParsedSandboxFunction,
   fnId: string,
   source: string,
-  byteToChar: number[]
+  byteToChar: ByteToCharFn
 ): string {
   const { fnInfo, configCallSource } = parsed;
   const exportPrefix = fnInfo.isExport
@@ -292,7 +294,7 @@ function generateServerStub(
   const fnName = fnInfo.isDefaultExport ? "" : fnInfo.name;
   const paramsSource = getParamsSource(fnInfo.params, source, byteToChar);
   const paramNames = extractParamNames(fnInfo.params);
-  const argsObj = paramNames.length > 0 ? `{ ${paramNames.join(", ")} }` : "{}";
+  const argsArray = paramNames.length > 0 ? `[${paramNames.join(", ")}]` : "[]";
 
   // Extract config from sandboxConfig() call or use empty object
   let configSource = "{}";
@@ -310,22 +312,8 @@ function generateServerStub(
   return __sandbox_runSandboxFn({
     fnId: "${fnId}",
     config: ${configSource},
-    args: ${argsObj}
+    args: ${argsArray}
   });
-}`;
-}
-
-function generateExtractedFunction(
-  parsed: ParsedSandboxFunction,
-  fnId: string,
-  source: string,
-  byteToChar: number[]
-): string {
-  const { fnInfo, remainingBodySource } = parsed;
-  const paramsSource = getParamsSource(fnInfo.params, source, byteToChar);
-
-  return `export async function ${fnId}(${paramsSource}) {
-  ${remainingBodySource}
 }`;
 }
 
@@ -361,32 +349,51 @@ export async function transform(
     replacement: string;
   }> = [];
 
+  // Detect base offset: SWC may use global byte positions instead of file-relative
+  // Find the minimum span.start across all statements to determine the base offset
+  let baseOffset = 0;
+  if (module.body.length > 0) {
+    const firstSpanStart = module.body[0].span?.start ?? 1;
+    if (firstSpanStart > byteToChar.length) {
+      // Spans are beyond source length, need to adjust
+      baseOffset = firstSpanStart - 1; // -1 because spans are 1-indexed
+    }
+  }
+
+  // Create adjusted byte-to-char lookup that accounts for base offset
+  const adjustedByteToChar = (bytePos: number): number => {
+    const adjustedPos = bytePos - baseOffset;
+    if (adjustedPos < 0 || adjustedPos >= byteToChar.length) {
+      return 0;
+    }
+    return byteToChar[adjustedPos];
+  };
+
   for (const stmt of module.body) {
-    const fnInfo = extractFunctionInfo(stmt, byteToChar);
+    const fnInfo = extractFunctionInfoWithOffset(stmt, adjustedByteToChar);
     if (!fnInfo) continue;
     if (!hasSandboxDirective(fnInfo.body)) continue;
 
-    const parsed = parseSandboxFunction(fnInfo, source, byteToChar);
+    const parsed = parseSandboxFunction(fnInfo, source, adjustedByteToChar);
     const fnId = generateFnId(fnInfo.name, parsed.remainingBodySource);
 
-    const serverStub = generateServerStub(parsed, fnId, source, byteToChar);
-    const extractedFn = generateExtractedFunction(
+    const serverStub = generateServerStub(
       parsed,
       fnId,
       source,
-      byteToChar
+      adjustedByteToChar
     );
 
     extractedFunctions.push({
       fnId,
       fnName: fnInfo.name,
       params: extractParamNames(fnInfo.params),
-      body: extractedFn,
+      body: "", // Body is no longer extracted - esbuild handles it
       sourceFile: filename,
     });
 
-    // Register for bundling
-    registerSandboxFunction(fnId, extractedFn, filename);
+    // Register for bundling (just metadata, esbuild will read the source)
+    registerSandboxFunction(fnId, fnInfo.name, filename);
 
     replacements.push({
       start: fnInfo.startOffset,

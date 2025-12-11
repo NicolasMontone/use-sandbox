@@ -1,6 +1,16 @@
-import { streamText, stepCountIs, type CoreMessage } from "ai";
+import { streamText, stepCountIs, UIMessage, convertToModelMessages } from "ai";
 import { gateway } from "@ai-sdk/gateway";
 import { z } from "zod";
+import fs from "fs/promises";
+
+// Helper to log with timestamp
+function log(context: string, message: string, data?: unknown) {
+  const timestamp = new Date().toISOString().split("T")[1].slice(0, -1);
+  console.log(`[${timestamp}] [${context}] ${message}`);
+  if (data !== undefined) {
+    console.log(JSON.stringify(data, null, 2));
+  }
+}
 
 /**
  * Read a file from the sandbox filesystem.
@@ -8,7 +18,7 @@ import { z } from "zod";
  */
 async function sandboxReadFile(path: string): Promise<string> {
   "use sandbox";
-  const fs = await import("fs/promises");
+  console.log("sandboxReadFile!", path);
   try {
     return await fs.readFile(path, "utf-8");
   } catch (error) {
@@ -28,7 +38,6 @@ async function sandboxWriteFile(
   content: string
 ): Promise<string> {
   "use sandbox";
-  const fs = await import("fs/promises");
   const pathModule = await import("path");
 
   // Ensure directory exists
@@ -45,7 +54,6 @@ async function sandboxWriteFile(
  */
 async function sandboxListFiles(directory: string): Promise<string> {
   "use sandbox";
-  const fs = await import("fs/promises");
   try {
     const entries = await fs.readdir(directory, { withFileTypes: true });
     const files = entries.map(
@@ -82,13 +90,13 @@ async function sandboxRunCommand(command: string): Promise<string> {
  * Main chat handler. Uses sandboxConfig to configure a per-session sandbox.
  */
 export async function POST(req: Request) {
-  const {
-    messages,
-    sessionId,
-  }: { messages: CoreMessage[]; sessionId?: string } = await req.json();
+  const { messages, sessionId }: { messages: UIMessage[]; sessionId?: string } =
+    await req.json();
+
+  log("POST", `Received ${messages.length} messages`, { sessionId });
 
   const result = streamText({
-    model: gateway("openai/gpt-4o"),
+    model: gateway("anthropic/claude-sonnet-4.5"),
     system: `You are a helpful AI assistant with access to a sandboxed file system.
 You can read, write, and list files, as well as run shell commands.
 The sandbox runs on a Linux system with Node.js installed.
@@ -101,7 +109,20 @@ Always confirm with the user before making changes.`,
           path: z.string().describe("The absolute path to the file to read"),
         }),
         execute: async ({ path }) => {
-          return await sandboxReadFile(path);
+          log("TOOL", "readFile called", { path });
+          const startTime = Date.now();
+          try {
+            const result = await sandboxReadFile(path);
+            log("TOOL", `readFile completed in ${Date.now() - startTime}ms`, {
+              path,
+              resultLength: result.length,
+              preview: result.slice(0, 100),
+            });
+            return result;
+          } catch (error) {
+            log("TOOL", "readFile ERROR", { path, error: String(error) });
+            throw error;
+          }
         },
       },
       writeFile: {
@@ -111,8 +132,22 @@ Always confirm with the user before making changes.`,
           content: z.string().describe("The content to write to the file"),
         }),
         execute: async ({ path, content }) => {
-          console.log("Writing file", path, content);
-          return await sandboxWriteFile(path, content);
+          log("TOOL", "writeFile called", {
+            path,
+            contentLength: content.length,
+          });
+          const startTime = Date.now();
+          try {
+            const result = await sandboxWriteFile(path, content);
+            log("TOOL", `writeFile completed in ${Date.now() - startTime}ms`, {
+              path,
+              result,
+            });
+            return result;
+          } catch (error) {
+            log("TOOL", "writeFile ERROR", { path, error: String(error) });
+            throw error;
+          }
         },
       },
       listFiles: {
@@ -123,8 +158,19 @@ Always confirm with the user before making changes.`,
             .describe("The absolute path to the directory to list"),
         }),
         execute: async ({ directory }) => {
-          console.log("Listing files in", directory);
-          return await sandboxListFiles(directory);
+          log("TOOL", "listFiles called", { directory });
+          const startTime = Date.now();
+          try {
+            const result = await sandboxListFiles(directory);
+            log("TOOL", `listFiles completed in ${Date.now() - startTime}ms`, {
+              directory,
+              result,
+            });
+            return result;
+          } catch (error) {
+            log("TOOL", "listFiles ERROR", { directory, error: String(error) });
+            throw error;
+          }
         },
       },
       runCommand: {
@@ -133,14 +179,26 @@ Always confirm with the user before making changes.`,
           command: z.string().describe("The shell command to execute"),
         }),
         execute: async ({ command }) => {
-          console.log("Running command", command);
-          return await sandboxRunCommand(command);
+          log("TOOL", "runCommand called", { command });
+          const startTime = Date.now();
+          try {
+            const result = await sandboxRunCommand(command);
+            log("TOOL", `runCommand completed in ${Date.now() - startTime}ms`, {
+              command,
+              result,
+            });
+            return result;
+          } catch (error) {
+            log("TOOL", "runCommand ERROR", { command, error: String(error) });
+            throw error;
+          }
         },
       },
     },
     stopWhen: stepCountIs(10),
-    messages,
+    messages: convertToModelMessages(messages),
   });
 
-  return result.toTextStreamResponse();
+  log("POST", "Streaming response...");
+  return result.toUIMessageStreamResponse();
 }

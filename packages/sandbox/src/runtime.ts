@@ -1,6 +1,8 @@
 import { Sandbox } from "@vercel/sandbox";
 import { sandboxContext, hasSandboxContext } from "./context.js";
-import { RUNNER_SCRIPT, RUNNER_SCRIPT_PATH } from "./runner.js";
+import { RUNNER_SCRIPT, RUNNER_SCRIPT_PATH, SANDBOX_BUNDLE_PATH } from "./runner.js";
+import { readFileSync } from "fs";
+import { join } from "path";
 
 export interface SandboxOptions {
   /**
@@ -195,50 +197,88 @@ export interface SandboxConfig {
 export interface RunSandboxFnOptions {
   fnId: string;
   config: SandboxConfig;
-  args: Record<string, unknown>;
+  args: unknown[];
 }
 
-// Track sandboxes with runner script installed
-const sandboxesWithRunner = new WeakSet<Sandbox>();
+// Cache for bundle content (read once from disk)
+let cachedBundleContent: string | null = null;
+let cachedBundleHash: string | null = null;
 
-/**
- * Get the bundle URL from environment or compute it.
- */
-function getBundleUrl(): string {
-  // Check for build-time injected URL
-  if (process.env.__SANDBOX_BUNDLE_URL) {
-    return process.env.__SANDBOX_BUNDLE_URL;
-  }
+// Track what's installed in each sandbox
+const installedInSandbox = new WeakMap<Sandbox, { runner: boolean; bundleHash: string | null }>();
 
-  // Compute based on Vercel environment
-  const hash = process.env.__SANDBOX_BUNDLE_HASH || "latest";
-  let baseUrl: string;
-
-  if (process.env.VERCEL_ENV === "production") {
-    baseUrl = `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`;
-  } else if (process.env.VERCEL_ENV === "preview") {
-    baseUrl = `https://${process.env.VERCEL_BRANCH_URL}`;
-  } else {
-    const port = process.env.PORT || "3000";
-    baseUrl = `http://localhost:${port}`;
-  }
-
-  return `${baseUrl}/_next/static/sandbox/bundle-${hash}.js`;
+interface BundleManifest {
+  hash: string;
+  bundleFile: string;
+  functions: Array<{ id: string; sourceFile: string }>;
 }
 
 /**
- * Ensure the runner script is installed in the sandbox.
+ * Read the bundle content from disk.
+ * Caches the result for subsequent calls.
  */
-async function ensureRunnerInstalled(sandbox: Sandbox): Promise<void> {
-  if (sandboxesWithRunner.has(sandbox)) {
-    return;
+function getBundleContent(): { content: string; hash: string } {
+  if (cachedBundleContent && cachedBundleHash) {
+    return { content: cachedBundleContent, hash: cachedBundleHash };
   }
 
-  await sandbox.writeFiles([
-    { path: RUNNER_SCRIPT_PATH, content: Buffer.from(RUNNER_SCRIPT, "utf-8") },
-  ]);
+  const manifestPath = join(process.cwd(), ".next/static/sandbox/manifest.json");
+  
+  let manifest: BundleManifest;
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+  } catch (err) {
+    throw new Error(
+      `Failed to read sandbox manifest at ${manifestPath}. ` +
+      `Make sure you've run 'next build' and the withSandbox() plugin is configured. ` +
+      `Error: ${(err as Error).message}`
+    );
+  }
 
-  sandboxesWithRunner.add(sandbox);
+  const bundlePath = join(process.cwd(), ".next/static/sandbox", manifest.bundleFile);
+  
+  try {
+    cachedBundleContent = readFileSync(bundlePath, "utf-8");
+    cachedBundleHash = manifest.hash;
+  } catch (err) {
+    throw new Error(
+      `Failed to read sandbox bundle at ${bundlePath}. ` +
+      `Error: ${(err as Error).message}`
+    );
+  }
+
+  return { content: cachedBundleContent, hash: cachedBundleHash };
+}
+
+/**
+ * Ensure the runner script and bundle are installed in the sandbox.
+ */
+async function ensureSandboxReady(sandbox: Sandbox): Promise<void> {
+  const installed = installedInSandbox.get(sandbox) ?? { runner: false, bundleHash: null };
+  const { content: bundleContent, hash: bundleHash } = getBundleContent();
+
+  const filesToWrite: Array<{ path: string; content: Buffer }> = [];
+
+  // Add runner if not installed
+  if (!installed.runner) {
+    filesToWrite.push({
+      path: RUNNER_SCRIPT_PATH,
+      content: Buffer.from(RUNNER_SCRIPT, "utf-8"),
+    });
+  }
+
+  // Add bundle if not installed or hash changed
+  if (installed.bundleHash !== bundleHash) {
+    filesToWrite.push({
+      path: SANDBOX_BUNDLE_PATH,
+      content: Buffer.from(bundleContent, "utf-8"),
+    });
+  }
+
+  if (filesToWrite.length > 0) {
+    await sandbox.writeFiles(filesToWrite);
+    installedInSandbox.set(sandbox, { runner: true, bundleHash });
+  }
 }
 
 /**
@@ -257,17 +297,13 @@ export async function __runSandboxFn<T>(
   });
 
   try {
-    // Ensure runner script is installed
-    await ensureRunnerInstalled(sandbox);
-
-    // Get bundle URL
-    const bundleUrl = getBundleUrl();
+    // Ensure runner script and bundle are installed
+    await ensureSandboxReady(sandbox);
 
     // Run the function via the runner script
     const argsJson = JSON.stringify(args);
     const result = await sandbox.runCommand("node", [
       RUNNER_SCRIPT_PATH,
-      bundleUrl,
       fnId,
       argsJson,
     ]);
