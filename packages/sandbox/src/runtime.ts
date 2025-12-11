@@ -1,211 +1,164 @@
 import { Sandbox } from "@vercel/sandbox";
 import { sandboxContext, hasSandboxContext } from "./context.js";
-import { RUNNER_SCRIPT, RUNNER_SCRIPT_PATH, SANDBOX_BUNDLE_PATH } from "./runner.js";
+import {
+  RUNNER_SCRIPT,
+  RUNNER_SCRIPT_PATH,
+  SANDBOX_BUNDLE_PATH,
+} from "./runner.js";
 import { readFileSync } from "fs";
 import { join } from "path";
 
-export interface SandboxOptions {
+// ============================================================================
+// Sandbox Configuration
+// ============================================================================
+
+type CreateSandboxParams = NonNullable<Parameters<typeof Sandbox.create>[0]>;
+
+export type SandboxConfig = Pick<
+  CreateSandboxParams,
+  "resources" | "timeout" | "source" | "runtime"
+>;
+
+/**
+ * Options for a single sandbox.run() call.
+ */
+export interface RunOptions {
   /**
-   * Timeout in milliseconds for the sandbox session.
-   * @default 300000 (5 minutes)
+   * Unique key for sandbox pooling.
    */
-  timeout?: number;
+  key: string;
+
+  /**
+   * Run command with root privileges.
+   * @default true
+   */
+  sudo?: boolean;
+}
+
+// ============================================================================
+// defineSandbox - Create a sandbox definition with pooling
+// ============================================================================
+
+/**
+ * Define a sandbox configuration for running sandbox functions.
+ *
+ * @example
+ * ```typescript
+ * // Define once
+ * export const sandbox = defineSandbox({ vcpus: 4, memory: 512 });
+ *
+ * // Use with a key for pooling
+ * await sandbox.run(sessionId, myFunction, arg1, arg2);
+ * ```
+ */
+export function defineSandbox(config: SandboxConfig = {}): SandboxDefinition {
+  return new SandboxDefinition(config);
 }
 
 /**
- * Run a function within a Vercel Sandbox context.
- * Creates a new sandbox, executes the function, and stops the sandbox when done.
- *
- * All "use exec" calls within the function will use this sandbox instance.
- *
- * @param fn - The async function to run within the sandbox context
- * @param options - Optional configuration for the sandbox
- * @returns The result of the function
+ * A sandbox definition that manages a pool of sandboxes by key.
  */
-export async function runInSandbox<T>(
-  fn: () => Promise<T>,
-  options?: SandboxOptions
-): Promise<T> {
-  // If we're already in a sandbox context, just run the function
-  // This supports nested "use sandbox" calls without creating extra sandboxes
-  if (hasSandboxContext()) {
-    return fn();
+export class SandboxDefinition {
+  private config: SandboxConfig;
+  private pool: Map<string, Sandbox> = new Map();
+
+  constructor(config: SandboxConfig) {
+    this.config = config;
   }
 
-  const sandbox = await Sandbox.create({
-    timeout: options?.timeout ?? 300_000, // 5 minutes default
-  });
+  /**
+   * Run a sandbox function with the given key.
+   *
+   * Same key = same sandbox (pooled and reused).
+   * Different key = different sandbox.
+   *
+   * @param keyOrOptions - Unique key for sandbox pooling, or options object
+   * @param fn - The sandbox function to run
+   * @param args - Arguments to pass to the function (as array)
+   *
+   * @example
+   * ```typescript
+   * // Simple: just a key
+   * await sandbox.run(sessionId, myFn, [arg1, arg2]);
+   *
+   * // With options
+   * await sandbox.run({ key: sessionId, sudo: false }, myFn, [arg1, arg2]);
+   * ```
+   */
+  async run<T, Args extends unknown[]>(
+    keyOrOptions: string | RunOptions,
+    fn: (...args: Args) => Promise<T>,
+    args: Args
+  ): Promise<T> {
+    const { key, sudo } =
+      typeof keyOrOptions === "string"
+        ? { key: keyOrOptions, sudo: true }
+        : { key: keyOrOptions.key, sudo: keyOrOptions.sudo ?? true };
 
-  try {
-    return await sandboxContext.run(sandbox, fn);
-  } finally {
-    await sandbox.stop();
-  }
-}
+    // Get or create sandbox for this key
+    let sandbox = this.pool.get(key);
 
-/**
- * Execute JavaScript code inside the current sandbox using Node.js.
- * Must be called within a "use sandbox" context.
- *
- * This is the runtime function that "use exec" directives are transformed to use.
- *
- * @param code - The JavaScript code string to execute in the sandbox
- * @param args - Arguments to pass to the code (available as __args)
- * @returns The result of the execution
- */
-export async function execInSandbox<T>(
-  code: string,
-  args?: Record<string, unknown>
-): Promise<T> {
-  const sandbox = sandboxContext.getStore();
-  if (!sandbox) {
-    throw new Error(
-      '"use exec" must be called within a "use sandbox" context. ' +
-        "Make sure your exec function is called from within a function marked with \"use sandbox\"."
-    );
-  }
+    if (!sandbox) {
+      sandbox = await Sandbox.create({
+        timeout: 300_000,
+        ...this.config,
+      });
 
-  // Wrap the code to handle args and return value
-  const wrappedCode = `
-const __args = ${JSON.stringify(args ?? {})};
-(async () => {
-  ${code}
-})().then(result => {
-  console.log(JSON.stringify({ __result: result }));
-}).catch(err => {
-  console.error(JSON.stringify({ __error: err.message }));
-  process.exit(1);
-});
-`;
+      // Ensure runner and bundle are installed
+      await ensureSandboxReady(sandbox);
 
-  // Write the code to a temp file and execute it
-  const tempFile = `/tmp/exec_${Date.now()}.mjs`;
-  await sandbox.writeFiles([
-    { path: tempFile, content: Buffer.from(wrappedCode, "utf-8") },
-  ]);
-
-  const result = await sandbox.runCommand("node", [tempFile]);
-  const stdout = await result.stdout();
-
-  // Parse the result
-  try {
-    const lines = stdout.trim().split("\n");
-    const lastLine = lines[lines.length - 1];
-    const parsed = JSON.parse(lastLine);
-
-    if (parsed.__error) {
-      throw new Error(parsed.__error);
+      this.pool.set(key, sandbox);
     }
 
-    return parsed.__result as T;
-  } catch (e) {
-    // If we can't parse, return the raw stdout
-    return stdout as unknown as T;
+    // Run the function with this sandbox in context (including sudo option)
+    return sandboxContext.run({ sandbox, sudo }, () => fn(...args));
   }
-}
 
-/**
- * Run a shell command in the current sandbox.
- * Must be called within a "use sandbox" context.
- *
- * @param cmd - The command to run
- * @param args - Arguments for the command
- * @returns The command result with stdout/stderr
- */
-export async function runCommand(
-  cmd: string,
-  args?: string[]
-): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  const sandbox = sandboxContext.getStore();
-  if (!sandbox) {
-    throw new Error(
-      'runCommand must be called within a "use sandbox" context.'
+  /**
+   * Stop and remove a sandbox by key.
+   */
+  async stop(key: string): Promise<void> {
+    const sandbox = this.pool.get(key);
+    if (sandbox) {
+      await sandbox.stop();
+      this.pool.delete(key);
+    }
+  }
+
+  /**
+   * Stop all sandboxes in the pool.
+   */
+  async stopAll(): Promise<void> {
+    const promises = Array.from(this.pool.entries()).map(
+      async ([key, sandbox]) => {
+        await sandbox.stop();
+        this.pool.delete(key);
+      }
     );
+    await Promise.all(promises);
   }
 
-  const result = await sandbox.runCommand(cmd, args);
-
-  return {
-    stdout: await result.stdout(),
-    stderr: await result.stderr(),
-    exitCode: result.exitCode,
-  };
-}
-
-/**
- * Read a file from the sandbox filesystem.
- * Must be called within a "use sandbox" context.
- */
-export async function readFile(path: string): Promise<string> {
-  const sandbox = sandboxContext.getStore();
-  if (!sandbox) {
-    throw new Error('readFile must be called within a "use sandbox" context.');
+  /**
+   * Get the number of active sandboxes in the pool.
+   */
+  get size(): number {
+    return this.pool.size;
   }
-
-  const stream = await sandbox.readFile({ path });
-  if (!stream) {
-    throw new Error(`File not found: ${path}`);
-  }
-
-  // Read the stream into a string
-  const chunks: Buffer[] = [];
-  for await (const chunk of stream) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-  return Buffer.concat(chunks).toString("utf-8");
-}
-
-/**
- * Write a file to the sandbox filesystem.
- * Must be called within a "use sandbox" context.
- */
-export async function writeFile(path: string, content: string): Promise<void> {
-  const sandbox = sandboxContext.getStore();
-  if (!sandbox) {
-    throw new Error('writeFile must be called within a "use sandbox" context.');
-  }
-
-  await sandbox.writeFiles([{ path, content: Buffer.from(content, "utf-8") }]);
 }
 
 // ============================================================================
-// New "use sandbox" directive runtime
+// Bundle and Runner Management
 // ============================================================================
-
-export interface SandboxConfig {
-  /**
-   * Unique key for sandbox pooling. Sandboxes with the same key may be reused.
-   */
-  key?: string;
-
-  /**
-   * Number of vCPUs for the sandbox.
-   */
-  vcpus?: number;
-
-  /**
-   * Memory in MB for the sandbox.
-   */
-  memory?: number;
-
-  /**
-   * Timeout in milliseconds.
-   */
-  timeout?: number;
-}
-
-export interface RunSandboxFnOptions {
-  fnId: string;
-  config: SandboxConfig;
-  args: unknown[];
-}
 
 // Cache for bundle content (read once from disk)
 let cachedBundleContent: string | null = null;
 let cachedBundleHash: string | null = null;
 
 // Track what's installed in each sandbox
-const installedInSandbox = new WeakMap<Sandbox, { runner: boolean; bundleHash: string | null }>();
+const installedInSandbox = new WeakMap<
+  Sandbox,
+  { runner: boolean; bundleHash: string | null }
+>();
 
 interface BundleManifest {
   hash: string;
@@ -222,28 +175,35 @@ function getBundleContent(): { content: string; hash: string } {
     return { content: cachedBundleContent, hash: cachedBundleHash };
   }
 
-  const manifestPath = join(process.cwd(), ".next/static/sandbox/manifest.json");
-  
+  const manifestPath = join(
+    process.cwd(),
+    ".next/static/sandbox/manifest.json"
+  );
+
   let manifest: BundleManifest;
   try {
     manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
   } catch (err) {
     throw new Error(
       `Failed to read sandbox manifest at ${manifestPath}. ` +
-      `Make sure you've run 'next build' and the withSandbox() plugin is configured. ` +
-      `Error: ${(err as Error).message}`
+        `Make sure you've built your app with the withSandbox() plugin configured. ` +
+        `Error: ${(err as Error).message}`
     );
   }
 
-  const bundlePath = join(process.cwd(), ".next/static/sandbox", manifest.bundleFile);
-  
+  const bundlePath = join(
+    process.cwd(),
+    ".next/static/sandbox",
+    manifest.bundleFile
+  );
+
   try {
     cachedBundleContent = readFileSync(bundlePath, "utf-8");
     cachedBundleHash = manifest.hash;
   } catch (err) {
     throw new Error(
       `Failed to read sandbox bundle at ${bundlePath}. ` +
-      `Error: ${(err as Error).message}`
+        `Error: ${(err as Error).message}`
     );
   }
 
@@ -254,7 +214,10 @@ function getBundleContent(): { content: string; hash: string } {
  * Ensure the runner script and bundle are installed in the sandbox.
  */
 async function ensureSandboxReady(sandbox: Sandbox): Promise<void> {
-  const installed = installedInSandbox.get(sandbox) ?? { runner: false, bundleHash: null };
+  const installed = installedInSandbox.get(sandbox) ?? {
+    runner: false,
+    bundleHash: null,
+  };
   const { content: bundleContent, hash: bundleHash } = getBundleContent();
 
   const filesToWrite: Array<{ path: string; content: Buffer }> = [];
@@ -281,60 +244,129 @@ async function ensureSandboxReady(sandbox: Sandbox): Promise<void> {
   }
 }
 
+// ============================================================================
+// __runSandboxFn - Called by transformed "use sandbox" functions
+// ============================================================================
+
+export interface RunSandboxFnOptions {
+  fnId: string;
+  config?: SandboxConfig;
+  args: unknown[];
+  /** Closure variables for nested sandbox functions */
+  closureVars?: Record<string, unknown>;
+}
+
 /**
  * Internal function called by transformed "use sandbox" functions.
- * Orchestrates sandbox creation and function execution.
+ *
+ * If called within a sandbox.run() context, uses that sandbox.
+ * Otherwise, creates an ephemeral sandbox for this call.
  */
 export async function __runSandboxFn<T>(
   options: RunSandboxFnOptions
 ): Promise<T> {
-  const { fnId, config, args } = options;
+  const { fnId, config = {}, args, closureVars } = options;
 
-  // Create or get sandbox (for now, always create - getOrCreate comes later)
+  // Check if we're already in a sandbox context (from sandbox.run)
+  const ctx = sandboxContext.getStore();
+
+  if (ctx) {
+    // Use the existing sandbox and sudo setting from context
+    return executeInSandbox(ctx.sandbox, fnId, args, closureVars, ctx.sudo);
+  }
+
+  // No context - create an ephemeral sandbox for this call
   const sandbox = await Sandbox.create({
-    timeout: config.timeout ?? 300_000,
-    // Note: vcpus and memory would be passed here when supported
+    timeout: 300_000,
+    ...config,
   });
 
   try {
-    // Ensure runner script and bundle are installed
     await ensureSandboxReady(sandbox);
+    return await executeInSandbox(sandbox, fnId, args, closureVars);
+  } finally {
+    await sandbox.stop();
+  }
+}
 
-    // Run the function via the runner script
-    const argsJson = JSON.stringify(args);
-    const result = await sandbox.runCommand("node", [
-      RUNNER_SCRIPT_PATH,
-      fnId,
-      argsJson,
-    ]);
+/**
+ * Execute a function in the given sandbox.
+ */
+async function executeInSandbox<T>(
+  sandbox: Sandbox,
+  fnId: string,
+  args: unknown[],
+  closureVars?: Record<string, unknown>,
+  sudo: boolean = true
+): Promise<T> {
+  // Build payload for runner
+  const payload: { args: unknown[]; closureVars?: Record<string, unknown> } = {
+    args,
+  };
+  if (closureVars) {
+    payload.closureVars = closureVars;
+  }
 
-    const stdout = await result.stdout();
-    const stderr = await result.stderr();
+  const payloadJson = JSON.stringify(payload);
+  const result = await sandbox.runCommand({
+    cmd: "node",
+    args: [RUNNER_SCRIPT_PATH, fnId, payloadJson],
+    sudo,
+  });
 
-    // Parse the result
-    try {
-      const lines = stdout.trim().split("\n");
-      const lastLine = lines[lines.length - 1];
-      const parsed = JSON.parse(lastLine);
+  const stdout = await result.stdout();
+  const stderr = await result.stderr();
 
-      if (parsed.__error) {
-        const error = new Error(parsed.__error);
-        if (parsed.__stack) {
-          error.stack = parsed.__stack;
-        }
-        throw error;
+  // Parse the result
+  try {
+    const lines = stdout.trim().split("\n");
+    const lastLine = lines[lines.length - 1];
+    const parsed = JSON.parse(lastLine);
+
+    if (parsed.__error) {
+      const error = new Error(parsed.__error);
+      if (parsed.__stack) {
+        error.stack = parsed.__stack;
       }
-
-      return parsed.__result as T;
-    } catch (e) {
-      if (e instanceof SyntaxError) {
-        // JSON parse failed - likely an error in the runner
-        throw new Error(
-          `Sandbox execution failed.\nstdout: ${stdout}\nstderr: ${stderr}`
-        );
-      }
-      throw e;
+      throw error;
     }
+
+    return parsed.__result as T;
+  } catch (e) {
+    if (e instanceof SyntaxError) {
+      throw new Error(
+        `Sandbox execution failed.\nstdout: ${stdout}\nstderr: ${stderr}`
+      );
+    }
+    throw e;
+  }
+}
+
+// ============================================================================
+// Legacy APIs (for backward compatibility)
+// ============================================================================
+
+export interface SandboxOptions {
+  timeout?: number;
+}
+
+/**
+ * @deprecated Use defineSandbox() instead
+ */
+export async function runInSandbox<T>(
+  fn: () => Promise<T>,
+  options?: SandboxOptions
+): Promise<T> {
+  if (hasSandboxContext()) {
+    return fn();
+  }
+
+  const sandbox = await Sandbox.create({
+    timeout: options?.timeout ?? 300_000,
+  });
+
+  try {
+    return await sandboxContext.run({ sandbox, sudo: true }, fn);
   } finally {
     await sandbox.stop();
   }
@@ -342,15 +374,11 @@ export async function __runSandboxFn<T>(
 
 /**
  * sandboxConfig is a marker function used in "use sandbox" functions
- * to configure sandbox options. It's extracted at build time and
- * never actually executes at runtime.
+ * to configure sandbox options. It's extracted at build time.
+ *
+ * @deprecated With defineSandbox(), config is passed to defineSandbox() instead
  */
 export function sandboxConfig(_config: SandboxConfig): void {
-  // This function is extracted at build time.
-  // If it runs, the transform didn't work correctly.
-  throw new Error(
-    "sandboxConfig() was called at runtime. This indicates the 'use sandbox' " +
-      "transform is not working correctly. Make sure you're using withSandbox() " +
-      "in your next.config.ts."
-  );
+  // This function is a no-op at runtime.
+  // Config is now passed to defineSandbox() instead.
 }

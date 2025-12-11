@@ -18,33 +18,44 @@ export const SANDBOX_BUNDLE_PATH = "/tmp/sandbox-bundle.mjs";
 /**
  * The runner script source code that gets written to the sandbox.
  * This is a self-contained ESM module.
+ *
+ * Protocol:
+ *   node runner.mjs <fnId> <payloadJson>
+ *
+ * Payload format:
+ *   { args: unknown[], closureVars?: Record<string, unknown> }
+ *
+ * If closureVars is present, it's passed as the first argument to the function.
  */
 export const RUNNER_SCRIPT = `
-async function run(fnId, args) {
-  // Bundle is pre-written to the sandbox by the host
+async function run(fnId, payload) {
   const bundle = await import("/tmp/sandbox-bundle.mjs");
 
   const fn = bundle[fnId];
   if (!fn) {
-    throw new Error("Function not found in bundle: " + fnId + ". Available: " + Object.keys(bundle).join(", "));
+    throw new Error("Function not found: " + fnId + ". Available: " + Object.keys(bundle).join(", "));
   }
 
-  // Spread args array as positional arguments
-  const result = await fn(...args);
+  const { args = [], closureVars } = payload;
+
+  // If closureVars exist, prepend them as first argument
+  // The generated sandbox function expects: fn(__closure, ...originalArgs)
+  const allArgs = closureVars ? [closureVars, ...args] : args;
+
+  const result = await fn(...allArgs);
   return result;
 }
 
-// Main execution
-const [,, fnId, argsJson] = process.argv;
+const [,, fnId, payloadJson] = process.argv;
 
 if (!fnId) {
-  console.error(JSON.stringify({ __error: "Usage: node runner.mjs <fnId> <argsJson>" }));
+  console.error(JSON.stringify({ __error: "Usage: node runner.mjs <fnId> <payloadJson>" }));
   process.exit(1);
 }
 
-const args = argsJson ? JSON.parse(argsJson) : {};
+const payload = payloadJson ? JSON.parse(payloadJson) : { args: [] };
 
-run(fnId, args)
+run(fnId, payload)
   .then(result => {
     console.log(JSON.stringify({ __result: result }));
   })
@@ -58,4 +69,3 @@ run(fnId, args)
  * Path where the runner script is written in the sandbox filesystem.
  */
 export const RUNNER_SCRIPT_PATH = "/tmp/sandbox-runner.mjs";
-

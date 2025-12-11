@@ -3,13 +3,16 @@
  *
  * This loader:
  * 1. Transforms "use sandbox" functions into server stubs
- * 2. Registers extracted function bodies
- * 3. Generates the bundle synchronously (so it's ready before requests)
+ * 2. Generates .sandbox.ts content for each file
+ * 3. Bundles all sandbox functions for execution in the sandbox
  */
 
 import { transform } from "./transformer";
-import { generateBundleSync } from "./bundler";
-import { hasRegisteredFunctions } from "./registry";
+import {
+  registerSandboxFile,
+  generateBundleSync,
+  hasSandboxFiles,
+} from "./bundler";
 
 /**
  * Webpack/Turbopack loader for sandbox directive transformation
@@ -19,7 +22,7 @@ export default async function sandboxLoader(
 ): Promise<string> {
   const normalizedSource = source.toString();
 
-  // Skip if already transformed (prevents re-transformation in turbopack)
+  // Skip if already transformed
   if (normalizedSource.includes("__sandbox_runSandboxFn")) {
     return normalizedSource;
   }
@@ -29,27 +32,30 @@ export default async function sandboxLoader(
     return normalizedSource;
   }
 
-  // Get the resource path from webpack loader context
-  // @ts-expect-error - this is available in webpack loader context
+  // @ts-expect-error - webpack loader context
   const resourcePath: string = this?.resourcePath || "unknown.ts";
+
+  // Skip .sandbox.ts files (we generate these)
+  if (resourcePath.includes(".sandbox.")) {
+    return normalizedSource;
+  }
 
   try {
     const result = await transform(normalizedSource, resourcePath);
 
-    // Generate bundle synchronously if we have sandbox functions
-    if (result.hasSandboxFunctions && hasRegisteredFunctions()) {
-      const bundleResult = generateBundleSync();
-      if (bundleResult) {
-        console.log(
-          `[use-sandbox] Bundle ready: ${bundleResult.functionIds.length} functions`
-        );
+    if (result.hasSandboxFunctions && result.sandboxFileContent) {
+      // Register the sandbox file for bundling
+      registerSandboxFile(result.sandboxFilePath!, result.sandboxFileContent);
+
+      // Generate bundle if we have files
+      if (hasSandboxFiles()) {
+        generateBundleSync();
       }
     }
 
     return result.code;
   } catch (error) {
-    // If transformation fails, log the error and return original source
-    console.error(`[use-sandbox] Failed to transform ${resourcePath}:`, error);
+    console.error(`[use-sandbox] Transform failed for ${resourcePath}:`, error);
     return normalizedSource;
   }
 }

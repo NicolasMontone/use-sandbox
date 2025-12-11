@@ -1,7 +1,14 @@
-import { streamText, stepCountIs, UIMessage, convertToModelMessages } from "ai";
-import { gateway } from "@ai-sdk/gateway";
+import {
+  streamText,
+  stepCountIs,
+  UIMessage,
+  convertToModelMessages,
+  generateText,
+} from "ai";
+import { gateway, createGateway } from "@ai-sdk/gateway";
 import { z } from "zod";
 import fs from "fs/promises";
+import { defineSandbox, $ } from "@use-sandbox/core";
 
 // Helper to log with timestamp
 function log(context: string, message: string, data?: unknown) {
@@ -12,19 +19,46 @@ function log(context: string, message: string, data?: unknown) {
   }
 }
 
+// Define the sandbox configuration once
+const sandbox = defineSandbox({ resources: { vcpus: 2 }, timeout: 300_000 });
+
 /**
  * Read a file from the sandbox filesystem.
  * This function runs inside the sandbox.
  */
 async function sandboxReadFile(path: string): Promise<string> {
   "use sandbox";
-  console.log("sandboxReadFile!", path);
   try {
     return await fs.readFile(path, "utf-8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return `Error: File not found at ${path}`;
     }
+    throw error;
+  }
+}
+
+/**
+ * Read a file from the sandbox filesystem.
+ * This function runs inside the sandbox.
+ */
+async function generateTextWithAI({
+  message,
+  apiKey,
+}: {
+  message: string;
+  apiKey: string;
+}) {
+  "use sandbox";
+  try {
+    const gateway = createGateway({ apiKey });
+    const result = await generateText({
+      system: "You are a helpful assistant that can generate text.",
+      model: gateway("deepseek/deepseek-v3.1"),
+      messages: [{ role: "user", content: message }],
+    });
+    return result.content;
+  } catch (error) {
     throw error;
   }
 }
@@ -71,6 +105,13 @@ async function sandboxListFiles(directory: string): Promise<string> {
 /**
  * Run a shell command in the sandbox.
  * This function runs inside the sandbox.
+ *
+ * Note: For AI-provided commands, we use exec() since the command string
+ * comes at runtime. This is acceptable because the sandbox isolates execution.
+ *
+ * For developer-controlled commands, prefer the $ template literal:
+ *   await $`git status`
+ *   await $`git commit -m ${message}`  // Safe: message is a single argument
  */
 async function sandboxRunCommand(command: string): Promise<string> {
   "use sandbox";
@@ -87,11 +128,29 @@ async function sandboxRunCommand(command: string): Promise<string> {
 }
 
 /**
- * Main chat handler. Uses sandboxConfig to configure a per-session sandbox.
+ * Example: Safe git operations using the $ template literal.
+ * Interpolated values are treated as single arguments, preventing injection.
+ */
+async function sandboxGitCommit(message: string): Promise<string> {
+  "use sandbox";
+  try {
+    await $`git add .`;
+    const result = await $`git commit -m ${message}`;
+    return result;
+  } catch (error) {
+    return `Git error: ${(error as Error).message}`;
+  }
+}
+
+/**
+ * Main chat handler.
+ * Uses sandbox.run() with sessionId for sandbox pooling.
  */
 export async function POST(req: Request) {
-  const { messages, sessionId }: { messages: UIMessage[]; sessionId?: string } =
-    await req.json();
+  const {
+    messages,
+    sessionId = "default",
+  }: { messages: UIMessage[]; sessionId?: string } = await req.json();
 
   log("POST", `Received ${messages.length} messages`, { sessionId });
 
@@ -109,10 +168,14 @@ Always confirm with the user before making changes.`,
           path: z.string().describe("The absolute path to the file to read"),
         }),
         execute: async ({ path }) => {
-          log("TOOL", "readFile called", { path });
+          log("TOOL", "readFile called", { path, sessionId });
           const startTime = Date.now();
           try {
-            const result = await sandboxReadFile(path);
+            // Use sandbox.run with sessionId for pooling (args as array)
+            const result = await sandbox.run(sessionId, sandboxReadFile, [
+              path,
+            ]);
+
             log("TOOL", `readFile completed in ${Date.now() - startTime}ms`, {
               path,
               resultLength: result.length,
@@ -121,6 +184,35 @@ Always confirm with the user before making changes.`,
             return result;
           } catch (error) {
             log("TOOL", "readFile ERROR", { path, error: String(error) });
+            throw error;
+          }
+        },
+      },
+      generateText: {
+        description: "Generate text with AI",
+        inputSchema: z.object({
+          message: z.string().describe("The message to generate text with"),
+        }),
+        execute: async ({ message }) => {
+          log("TOOL", "generateText called", { message, sessionId });
+          const startTime = Date.now();
+          try {
+            // Use sandbox.run with sessionId for pooling (args as array)
+            const result = await sandbox.run(sessionId, generateTextWithAI, [
+              { message, apiKey: process.env.AI_GATEWAY_API_KEY! },
+            ]);
+
+            log(
+              "TOOL",
+              `generateText completed in ${Date.now() - startTime}ms`,
+              result
+            );
+            return result;
+          } catch (error) {
+            log("TOOL", "generateText ERROR", {
+              message,
+              error: String(error),
+            });
             throw error;
           }
         },
@@ -135,10 +227,14 @@ Always confirm with the user before making changes.`,
           log("TOOL", "writeFile called", {
             path,
             contentLength: content.length,
+            sessionId,
           });
           const startTime = Date.now();
           try {
-            const result = await sandboxWriteFile(path, content);
+            const result = await sandbox.run(sessionId, sandboxWriteFile, [
+              path,
+              content,
+            ]);
             log("TOOL", `writeFile completed in ${Date.now() - startTime}ms`, {
               path,
               result,
@@ -158,10 +254,12 @@ Always confirm with the user before making changes.`,
             .describe("The absolute path to the directory to list"),
         }),
         execute: async ({ directory }) => {
-          log("TOOL", "listFiles called", { directory });
+          log("TOOL", "listFiles called", { directory, sessionId });
           const startTime = Date.now();
           try {
-            const result = await sandboxListFiles(directory);
+            const result = await sandbox.run(sessionId, sandboxListFiles, [
+              directory,
+            ]);
             log("TOOL", `listFiles completed in ${Date.now() - startTime}ms`, {
               directory,
               result,
@@ -179,10 +277,12 @@ Always confirm with the user before making changes.`,
           command: z.string().describe("The shell command to execute"),
         }),
         execute: async ({ command }) => {
-          log("TOOL", "runCommand called", { command });
+          log("TOOL", "runCommand called", { command, sessionId });
           const startTime = Date.now();
           try {
-            const result = await sandboxRunCommand(command);
+            const result = await sandbox.run(sessionId, sandboxRunCommand, [
+              command,
+            ]);
             log("TOOL", `runCommand completed in ${Date.now() - startTime}ms`, {
               command,
               result,
