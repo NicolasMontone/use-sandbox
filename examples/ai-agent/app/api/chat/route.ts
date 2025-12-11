@@ -4,10 +4,10 @@ import { z } from "zod";
 
 /**
  * Read a file from the sandbox filesystem.
- * This function is marked with "use exec" and will run inside the sandbox.
+ * This function runs inside the sandbox.
  */
 async function sandboxReadFile(path: string): Promise<string> {
-  "use exec";
+  "use sandbox";
   const fs = await import("fs/promises");
   try {
     return await fs.readFile(path, "utf-8");
@@ -21,13 +21,13 @@ async function sandboxReadFile(path: string): Promise<string> {
 
 /**
  * Write content to a file in the sandbox filesystem.
- * This function is marked with "use exec" and will run inside the sandbox.
+ * This function runs inside the sandbox.
  */
 async function sandboxWriteFile(
   path: string,
   content: string
 ): Promise<string> {
-  "use exec";
+  "use sandbox";
   const fs = await import("fs/promises");
   const pathModule = await import("path");
 
@@ -41,15 +41,15 @@ async function sandboxWriteFile(
 
 /**
  * List files in a directory in the sandbox filesystem.
- * This function is marked with "use exec" and will run inside the sandbox.
+ * This function runs inside the sandbox.
  */
 async function sandboxListFiles(directory: string): Promise<string> {
-  "use exec";
+  "use sandbox";
   const fs = await import("fs/promises");
   try {
     const entries = await fs.readdir(directory, { withFileTypes: true });
     const files = entries.map(
-      (entry) => `${entry.isDirectory() ? "📁" : "📄"} ${entry.name}`
+      (entry) => `${entry.isDirectory() ? "[dir]" : "[file]"} ${entry.name}`
     );
     return files.length > 0 ? files.join("\n") : "Directory is empty";
   } catch (error) {
@@ -62,10 +62,10 @@ async function sandboxListFiles(directory: string): Promise<string> {
 
 /**
  * Run a shell command in the sandbox.
- * This function is marked with "use exec" and will run inside the sandbox.
+ * This function runs inside the sandbox.
  */
 async function sandboxRunCommand(command: string): Promise<string> {
-  "use exec";
+  "use sandbox";
   const { exec } = await import("child_process");
   const { promisify } = await import("util");
   const execAsync = promisify(exec);
@@ -79,13 +79,13 @@ async function sandboxRunCommand(command: string): Promise<string> {
 }
 
 /**
- * Main chat handler using "use sandbox" to establish sandbox context.
- * All tool executions share the same sandbox instance.
+ * Main chat handler. Uses sandboxConfig to configure a per-session sandbox.
  */
 export async function POST(req: Request) {
-  "use sandbox";
-
-  const { messages }: { messages: CoreMessage[] } = await req.json();
+  const {
+    messages,
+    sessionId,
+  }: { messages: CoreMessage[]; sessionId?: string } = await req.json();
 
   const result = streamText({
     model: gateway("openai/gpt-4o"),

@@ -27,6 +27,10 @@
     "./internal/private": {
       "types": "./dist/internal/private.d.ts",
       "default": "./dist/internal/private.js"
+    },
+    "./runner": {
+      "types": "./dist/runner.d.ts",
+      "default": "./dist/runner.js"
     }
   },
   "scripts": {

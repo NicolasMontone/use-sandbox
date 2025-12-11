@@ -29,6 +29,10 @@ export {
   runCommand,
   readFile,
   writeFile,
+  __runSandboxFn,
+  sandboxConfig,
   type SandboxOptions,
+  type SandboxConfig,
+  type RunSandboxFnOptions,
 } from './runtime.js';
 
