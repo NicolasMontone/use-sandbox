@@ -1,13 +1,15 @@
-import type { NextConfig } from 'next';
+import type { NextConfig } from "next";
 
 /**
- * Wrap your Next.js config with withSandbox to enable "use sandbox" and "use exec" directives.
- * 
+ * Wrap your Next.js config with withSandbox to enable "use sandbox" directive.
+ *
+ * Works with both webpack and turbopack, in dev and build modes.
+ *
  * @example
  * ```typescript
  * // next.config.ts
  * import { withSandbox } from '@use-sandbox/next';
- * 
+ *
  * export default withSandbox({
  *   // your next config
  * });
@@ -25,56 +27,58 @@ export function withSandbox(
     phase: string,
     ctx: { defaultConfig: NextConfig }
   ) {
-    const loaderPath = require.resolve('./loader');
+    const loaderPath = require.resolve("./loader");
 
     let nextConfig: NextConfig;
 
-    if (typeof nextConfigOrFn === 'function') {
+    if (typeof nextConfigOrFn === "function") {
       nextConfig = await nextConfigOrFn(phase, ctx);
     } else {
       nextConfig = nextConfigOrFn;
     }
-    
+
     // shallow clone to avoid read-only on top-level
     nextConfig = Object.assign({}, nextConfig);
 
-    // configure the loader if turbopack is being used
+    // Configure the loader for turbopack
     if (!nextConfig.turbopack) {
       nextConfig.turbopack = {};
     }
     if (!nextConfig.turbopack.rules) {
       nextConfig.turbopack.rules = {};
     }
-    
-    const existingRules = nextConfig.turbopack.rules as Record<string, any>;
+
+    const existingRules = nextConfig.turbopack.rules as Record<string, unknown>;
 
     for (const key of [
-      '*.tsx',
-      '*.ts',
-      '*.jsx',
-      '*.js',
-      '*.mjs',
-      '*.mts',
-      '*.cjs',
-      '*.cts',
+      "*.tsx",
+      "*.ts",
+      "*.jsx",
+      "*.js",
+      "*.mjs",
+      "*.mts",
+      "*.cjs",
+      "*.cts",
     ]) {
       nextConfig.turbopack.rules[key] = {
-        loaders: [...(existingRules[key]?.loaders || []), loaderPath],
+        loaders: [
+          ...((existingRules[key] as { loaders?: string[] })?.loaders || []),
+          loaderPath,
+        ],
       };
     }
 
-    // configure the loader for webpack
+    // Configure the loader for webpack
     const existingWebpackModify = nextConfig.webpack;
-    nextConfig.webpack = (...args) => {
-      const [webpackConfig] = args;
+    nextConfig.webpack = (webpackConfig, options) => {
       if (!webpackConfig.module) {
         webpackConfig.module = {};
       }
       if (!webpackConfig.module.rules) {
         webpackConfig.module.rules = [];
       }
-      
-      // loaders in webpack apply bottom->up so ensure
+
+      // Loaders in webpack apply bottom->up so ensure
       // ours comes before the default swc transform
       webpackConfig.module.rules.push({
         test: /.*\.(mjs|cjs|cts|ts|tsx|js|jsx)$/,
@@ -82,11 +86,10 @@ export function withSandbox(
       });
 
       return existingWebpackModify
-        ? existingWebpackModify(...args)
+        ? existingWebpackModify(webpackConfig, options)
         : webpackConfig;
     };
 
     return nextConfig;
   };
 }
-
