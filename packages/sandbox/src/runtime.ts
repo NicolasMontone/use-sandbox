@@ -55,15 +55,33 @@ export function defineSandbox(config: SandboxConfig = {}): SandboxDefinition {
   return new SandboxDefinition(config);
 }
 
+// Global sandbox pool that survives hot-reload in dev mode.
+// Using a symbol key to avoid conflicts with other code.
+const GLOBAL_POOL_KEY = Symbol.for("@use-sandbox/pool");
+
+function getGlobalPool(): Map<string, Sandbox> {
+  const g = globalThis as Record<symbol, Map<string, Sandbox>>;
+  if (!g[GLOBAL_POOL_KEY]) {
+    g[GLOBAL_POOL_KEY] = new Map();
+  }
+  return g[GLOBAL_POOL_KEY];
+}
+
 /**
  * A sandbox definition that manages a pool of sandboxes by key.
  */
 export class SandboxDefinition {
   private config: SandboxConfig;
-  private pool: Map<string, Sandbox> = new Map();
 
   constructor(config: SandboxConfig) {
     this.config = config;
+  }
+
+  /**
+   * Get the global pool (survives hot-reload).
+   */
+  private get pool(): Map<string, Sandbox> {
+    return getGlobalPool();
   }
 
   /**
@@ -103,12 +121,11 @@ export class SandboxDefinition {
         timeout: 300_000,
         ...this.config,
       });
-
-      // Ensure runner and bundle are installed
-      await ensureSandboxReady(sandbox);
-
       this.pool.set(key, sandbox);
     }
+
+    // Always ensure runner and bundle are up-to-date (checks hash on every use)
+    await ensureSandboxReady(sandbox, key);
 
     // Run the function with this sandbox in context (including sudo option)
     return sandboxContext.run({ sandbox, sudo }, () => fn(...args));
@@ -154,11 +171,21 @@ export class SandboxDefinition {
 let cachedBundleContent: string | null = null;
 let cachedBundleHash: string | null = null;
 
-// Track what's installed in each sandbox
-const installedInSandbox = new WeakMap<
-  Sandbox,
-  { runner: boolean; bundleHash: string | null }
->();
+import { getStorage } from "./storage.js";
+
+// Track if runner is installed in each sandbox (in-memory, per-process)
+// This is okay to lose on process restart since runner script is static
+const RUNNER_INSTALLED_KEY = Symbol.for("@use-sandbox/runner-installed");
+
+type RunnerInstalledMap = WeakMap<Sandbox, boolean>;
+
+function getRunnerInstalledMap(): RunnerInstalledMap {
+  const g = globalThis as Record<symbol, RunnerInstalledMap>;
+  if (!g[RUNNER_INSTALLED_KEY]) {
+    g[RUNNER_INSTALLED_KEY] = new WeakMap();
+  }
+  return g[RUNNER_INSTALLED_KEY];
+}
 
 interface BundleManifest {
   hash: string;
@@ -168,10 +195,14 @@ interface BundleManifest {
 
 /**
  * Read the bundle content from disk.
- * Caches the result for subsequent calls.
+ * In development, always re-reads to pick up changes.
+ * In production, caches the result for performance.
  */
 function getBundleContent(): { content: string; hash: string } {
-  if (cachedBundleContent && cachedBundleHash) {
+  const isDev = process.env.NODE_ENV !== "production";
+
+  // In production, use cached content if available
+  if (!isDev && cachedBundleContent && cachedBundleHash) {
     return { content: cachedBundleContent, hash: cachedBundleHash };
   }
 
@@ -213,25 +244,31 @@ function getBundleContent(): { content: string; hash: string } {
 /**
  * Ensure the runner script and bundle are installed in the sandbox.
  */
-async function ensureSandboxReady(sandbox: Sandbox): Promise<void> {
-  const installed = installedInSandbox.get(sandbox) ?? {
-    runner: false,
-    bundleHash: null,
-  };
+async function ensureSandboxReady(
+  sandbox: Sandbox,
+  sandboxKey: string
+): Promise<void> {
+  const runnerMap = getRunnerInstalledMap();
+  const runnerInstalled = runnerMap.get(sandbox) ?? false;
+
+  // Use storage for bundle hash (persists across processes)
+  const storage = getStorage();
+  const installedHash = storage.getInstalledHash(sandboxKey);
+
   const { content: bundleContent, hash: bundleHash } = getBundleContent();
 
   const filesToWrite: Array<{ path: string; content: Buffer }> = [];
 
-  // Add runner if not installed
-  if (!installed.runner) {
+  // Add runner if not installed (in-memory check is fine, runner is static)
+  if (!runnerInstalled) {
     filesToWrite.push({
       path: RUNNER_SCRIPT_PATH,
       content: Buffer.from(RUNNER_SCRIPT, "utf-8"),
     });
   }
 
-  // Add bundle if not installed or hash changed
-  if (installed.bundleHash !== bundleHash) {
+  // Add bundle if not installed or hash changed (uses persistent storage)
+  if (installedHash !== bundleHash) {
     filesToWrite.push({
       path: SANDBOX_BUNDLE_PATH,
       content: Buffer.from(bundleContent, "utf-8"),
@@ -240,7 +277,16 @@ async function ensureSandboxReady(sandbox: Sandbox): Promise<void> {
 
   if (filesToWrite.length > 0) {
     await sandbox.writeFiles(filesToWrite);
-    installedInSandbox.set(sandbox, { runner: true, bundleHash });
+    runnerMap.set(sandbox, true);
+    storage.setInstalledHash(sandboxKey, bundleHash);
+
+    // Log when bundle is updated (helpful for debugging hot-reload)
+    const isDev = process.env.NODE_ENV !== "production";
+    if (isDev && installedHash !== null) {
+      console.log(
+        `[use-sandbox] Bundle updated in sandbox (${installedHash?.slice(0, 8)} -> ${bundleHash.slice(0, 8)})`
+      );
+    }
   }
 }
 
@@ -282,7 +328,9 @@ export async function __runSandboxFn<T>(
   });
 
   try {
-    await ensureSandboxReady(sandbox);
+    // Ephemeral sandboxes use a unique key (won't persist, but that's fine)
+    const ephemeralKey = `ephemeral-${Date.now()}`;
+    await ensureSandboxReady(sandbox, ephemeralKey);
     return await executeInSandbox(sandbox, fnId, args, closureVars);
   } finally {
     await sandbox.stop();

@@ -40,6 +40,12 @@ export default async function sandboxLoader(
     return normalizedSource;
   }
 
+  // Skip workflow-generated routes - they import stubbed functions from original files
+  // Processing them would create duplicate sandbox files with stale inlined copies
+  if (resourcePath.includes(".well-known/workflow/")) {
+    return normalizedSource;
+  }
+
   try {
     const result = await transform(normalizedSource, resourcePath);
 

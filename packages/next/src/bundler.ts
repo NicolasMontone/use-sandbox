@@ -6,7 +6,13 @@
  */
 
 import { buildSync } from "esbuild";
-import { writeFileSync, mkdirSync, existsSync } from "fs";
+import {
+  writeFileSync,
+  mkdirSync,
+  existsSync,
+  readdirSync,
+  readFileSync,
+} from "fs";
 import { join, basename } from "path";
 import { createHash } from "crypto";
 
@@ -28,14 +34,35 @@ export interface BundleManifest {
 }
 
 // ============================================================================
-// State
+// State (using globalThis to survive hot-reload in dev mode)
 // ============================================================================
 
-// Track generated sandbox files
-const sandboxFiles = new Map<string, string>(); // path -> content
+// Using symbol keys to avoid conflicts
+const SANDBOX_FILES_KEY = Symbol.for("@use-sandbox/files");
+const BUNDLE_HASH_KEY = Symbol.for("@use-sandbox/bundleHash");
 
-// Track last bundle hash to avoid re-bundling
-let lastBundleHash: string | null = null;
+interface GlobalState {
+  [SANDBOX_FILES_KEY]?: Map<string, string>;
+  [BUNDLE_HASH_KEY]?: string | null;
+}
+
+function getSandboxFilesMap(): Map<string, string> {
+  const g = globalThis as unknown as GlobalState;
+  if (!g[SANDBOX_FILES_KEY]) {
+    g[SANDBOX_FILES_KEY] = new Map();
+  }
+  return g[SANDBOX_FILES_KEY];
+}
+
+function getLastBundleHash(): string | null {
+  const g = globalThis as unknown as GlobalState;
+  return g[BUNDLE_HASH_KEY] ?? null;
+}
+
+function setLastBundleHash(hash: string | null): void {
+  const g = globalThis as unknown as GlobalState;
+  g[BUNDLE_HASH_KEY] = hash;
+}
 
 // ============================================================================
 // Public API
@@ -46,40 +73,41 @@ let lastBundleHash: string | null = null;
  * Called by the loader after transformation.
  */
 export function registerSandboxFile(filePath: string, content: string): void {
-  sandboxFiles.set(filePath, content);
+  getSandboxFilesMap().set(filePath, content);
 }
 
 /**
  * Clear all registered sandbox files.
  */
 export function clearSandboxFiles(): void {
-  sandboxFiles.clear();
-  lastBundleHash = null;
+  getSandboxFilesMap().clear();
+  setLastBundleHash(null);
 }
 
 /**
  * Check if there are any sandbox files to bundle.
  */
 export function hasSandboxFiles(): boolean {
-  return sandboxFiles.size > 0;
+  return getSandboxFilesMap().size > 0;
 }
 
 /**
  * Get all registered sandbox files.
  */
 export function getSandboxFiles(): Map<string, string> {
-  return new Map(sandboxFiles);
+  return new Map(getSandboxFilesMap());
 }
 
 /**
  * Generate the sandbox bundle synchronously.
- * Returns null if no files or bundle is already up-to-date.
+ *
+ * IMPORTANT: Turbopack runs loaders in multiple worker processes, so we cannot
+ * rely on in-memory state to track all sandbox files. Instead, we:
+ * 1. Write sandbox files to temp directory in the loader (each worker writes its own)
+ * 2. Scan the temp directory for ALL .sandbox.ts files when bundling
+ * 3. Bundle everything we find on disk
  */
 export function generateBundleSync(): BundleResult | null {
-  if (sandboxFiles.size === 0) {
-    return null;
-  }
-
   const projectRoot = process.cwd();
   const tempDir = join(projectRoot, ".next", ".sandbox-temp");
   const outputDir = join(projectRoot, ".next", "static", "sandbox");
@@ -92,21 +120,37 @@ export function generateBundleSync(): BundleResult | null {
     mkdirSync(outputDir, { recursive: true });
   }
 
-  // Write sandbox files to temp directory
-  const entryPoints: string[] = [];
-  const allContent: string[] = [];
-
-  for (const [filePath, content] of sandboxFiles) {
-    // Create a unique filename in temp dir
+  // First, write any files from this process's Map to the temp directory
+  const sandboxFilesMap = getSandboxFilesMap();
+  for (const [filePath, content] of sandboxFilesMap) {
     const safeName = filePath
       .replace(projectRoot, "")
       .replace(/[/\\]/g, "__")
       .replace(/^__/, "");
     const tempPath = join(tempDir, safeName);
-
     writeFileSync(tempPath, content);
+  }
+
+  // Now scan the temp directory for ALL sandbox files (from all workers)
+  const files = readdirSync(tempDir).filter(
+    (f) => f.endsWith(".sandbox.ts") && !f.startsWith("_")
+  );
+
+  if (files.length === 0) {
+    return null;
+  }
+
+  // Read all sandbox files and compute hash
+  const entryPoints: string[] = [];
+  const allContent: string[] = [];
+  const allFilePaths: string[] = [];
+
+  for (const file of files.sort()) {
+    const tempPath = join(tempDir, file);
+    const content = readFileSync(tempPath, "utf-8");
     entryPoints.push(tempPath);
     allContent.push(content);
+    allFilePaths.push(tempPath);
   }
 
   // Compute hash of all content
@@ -117,7 +161,7 @@ export function generateBundleSync(): BundleResult | null {
     .slice(0, 16);
 
   // Skip if unchanged
-  if (bundleHash === lastBundleHash) {
+  if (bundleHash === getLastBundleHash()) {
     return null;
   }
 
@@ -144,7 +188,7 @@ export function generateBundleSync(): BundleResult | null {
       platform: "node",
       target: "node18",
       outfile: bundlePath,
-      minify: true,
+      minify: false,
       treeShaking: true,
       // Mark node builtins and frameworks as external
       external: [
@@ -190,21 +234,19 @@ export function generateBundleSync(): BundleResult | null {
     hash: bundleHash,
     bundleFile: bundleFilename,
     generatedAt: new Date().toISOString(),
-    sandboxFiles: Array.from(sandboxFiles.keys()),
+    sandboxFiles: allFilePaths,
   };
 
   const manifestPath = join(outputDir, "manifest.json");
   writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
 
-  lastBundleHash = bundleHash;
+  setLastBundleHash(bundleHash);
 
-  console.log(
-    `[use-sandbox] Bundle ready: ${sandboxFiles.size} sandbox file(s)`
-  );
+  console.log(`[use-sandbox] Bundle ready: ${files.length} sandbox file(s)`);
 
   return {
     bundlePath,
     bundleHash,
-    sandboxFiles: Array.from(sandboxFiles.keys()),
+    sandboxFiles: allFilePaths,
   };
 }

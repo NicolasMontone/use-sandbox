@@ -1,14 +1,17 @@
 /**
- * Transformer V2: Clean implementation inspired by Workflow.
+ * Transformer V3: AST-mutation approach (inspired by Workflow).
  *
- * Key differences from V1:
- * 1. Handles nested sandbox functions (not just top-level)
- * 2. Detects closure variables for nested functions
- * 3. Generates .sandbox.ts files for clean bundling
- * 4. Hoists nested functions with parent$child naming
+ * Key insight: Instead of string slicing with positions (which break in Turbopack
+ * due to global positions), we mutate the AST directly and let SWC print it.
+ *
+ * Flow:
+ * 1. Parse source → AST module
+ * 2. Walk AST, collect sandbox function info + track AST node locations
+ * 3. Replace sandbox function AST nodes with stub AST nodes
+ * 4. printSync(modified module) → output code
  */
 
-import { parse } from "@swc/core";
+import { parse, parseSync, printSync } from "@swc/core";
 import type {
   Module,
   ModuleItem,
@@ -22,6 +25,7 @@ import type {
   Pattern,
   Param,
   VariableDeclaration,
+  ExportDeclaration,
 } from "@swc/core";
 import { createHash } from "crypto";
 import { writeFileSync, mkdirSync, existsSync } from "fs";
@@ -53,11 +57,22 @@ interface SandboxFunction {
   bodySource: string;
   /** Full function source for the .sandbox.ts file */
   fullSource: string;
-  /** Location in original source for replacement */
-  location: { start: number; end: number };
   /** Is this an async function? */
   isAsync: boolean;
+  /** Location for AST replacement */
+  astLocation: AstLocation;
 }
+
+type AstLocation =
+  | { type: "module-item"; index: number }
+  | { type: "export-decl"; index: number }
+  | { type: "export-default"; index: number }
+  | { type: "var-declarator"; moduleIndex: number; declIndex: number }
+  | {
+      type: "export-var-declarator";
+      moduleIndex: number;
+      declIndex: number;
+    };
 
 interface ScopeInfo {
   /** Variables declared in this scope */
@@ -70,32 +85,17 @@ interface ScopeInfo {
 // Helpers
 // ============================================================================
 
-function createByteToCharMap(source: string): number[] {
-  const buffer = Buffer.from(source, "utf-8");
-  const map: number[] = new Array(buffer.length + 2);
-  map[0] = 0;
-
-  let codeUnitIndex = 0;
-  let byteIndex = 0;
-
-  for (const codePoint of source) {
-    const charByteLength = Buffer.byteLength(codePoint, "utf-8");
-    const charCodeUnitLength = codePoint.length;
-
-    for (let i = 0; i < charByteLength; i++) {
-      map[byteIndex + 1] = codeUnitIndex;
-      byteIndex++;
-    }
-    codeUnitIndex += charCodeUnitLength;
-  }
-
-  map[byteIndex + 1] = codeUnitIndex;
-  return map;
-}
-
-function generateFnId(scopePath: string[], bodyHash: string): string {
-  const pathPart = scopePath.join("$");
-  return `${pathPart}_${bodyHash}`;
+/**
+ * Generate a stable function ID based on file path and function name.
+ * This ensures the ID doesn't change when the function body is edited,
+ * which is critical for hot-reload to work correctly.
+ */
+function generateFnId(filename: string, scopePath: string[]): string {
+  const fnName = scopePath.join("$");
+  // Use file path + function name for stable ID (not code content)
+  const stableKey = `${filename}/${fnName}`;
+  const hash = hashString(stableKey);
+  return `${fnName}_${hash}`;
 }
 
 function hashString(str: string): string {
@@ -107,6 +107,84 @@ function isUseSandboxDirective(stmt: Statement): boolean {
   const expr = stmt.expression;
   if (expr.type !== "StringLiteral") return false;
   return expr.value === "use sandbox";
+}
+
+/**
+ * Print an AST node to source code using SWC's printer.
+ */
+function printAst(node: unknown): string {
+  const wrapper = {
+    type: "Module",
+    span: { start: 0, end: 0, ctxt: 0 },
+    body: Array.isArray(node) ? node : [node],
+    interpreter: null,
+  };
+
+  try {
+    const result = printSync(wrapper as any, {});
+    return result.code.trim();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Print function parameters to source code.
+ */
+function printParams(params: (Param | Pattern)[]): string {
+  if (params.length === 0) return "";
+
+  const normalizedParams = params.map((p) => {
+    if ("pat" in p) {
+      return { ...p, type: "Parameter" };
+    }
+    return {
+      type: "Parameter",
+      span: { start: 0, end: 0, ctxt: 0 },
+      decorators: [],
+      pat: p,
+    };
+  });
+
+  const dummyFn = {
+    type: "FunctionDeclaration",
+    span: { start: 0, end: 0, ctxt: 0 },
+    identifier: {
+      type: "Identifier",
+      span: { start: 0, end: 0, ctxt: 0 },
+      value: "_",
+      optional: false,
+      ctxt: 0,
+    },
+    declare: false,
+    params: normalizedParams,
+    body: {
+      type: "BlockStatement",
+      span: { start: 0, end: 0, ctxt: 0 },
+      stmts: [],
+      ctxt: 0,
+    },
+    generator: false,
+    async: false,
+    typeParameters: null,
+    returnType: null,
+    ctxt: 0,
+  };
+
+  const wrapper = {
+    type: "Module",
+    span: { start: 0, end: 0, ctxt: 0 },
+    body: [dummyFn],
+    interpreter: null,
+  };
+
+  try {
+    const result = printSync(wrapper as any, {});
+    const match = result.code.match(/function\s+_\s*\(([^)]*)\)/);
+    return match ? match[1].trim() : "";
+  } catch {
+    return "";
+  }
 }
 
 function extractParamNames(params: (Param | Pattern)[]): string[] {
@@ -163,65 +241,78 @@ type AnyFunction =
   | ArrowFunctionExpression;
 
 interface WalkContext {
-  source: string;
-  byteToChar: (pos: number) => number;
   currentScope: ScopeInfo;
   scopePath: string[];
   sandboxFunctions: SandboxFunction[];
+  /** Relative file path for stable function IDs */
+  filename: string;
 }
 
 /**
- * Walk the AST to find all sandbox functions, including nested ones.
+ * Walk the AST to find all sandbox functions, tracking AST locations.
  */
 function walkModule(module: Module, ctx: WalkContext): void {
-  for (const item of module.body) {
-    walkModuleItem(item, ctx);
+  for (let i = 0; i < module.body.length; i++) {
+    walkModuleItem(module.body[i], i, ctx);
   }
 }
 
-function walkModuleItem(item: ModuleItem, ctx: WalkContext): void {
+function walkModuleItem(
+  item: ModuleItem,
+  index: number,
+  ctx: WalkContext
+): void {
   switch (item.type) {
     case "FunctionDeclaration":
-      walkFunctionDecl(item, ctx, false, false);
+      walkFunctionDecl(item, ctx, { type: "module-item", index });
       break;
     case "ExportDeclaration":
       if (item.declaration.type === "FunctionDeclaration") {
-        walkFunctionDecl(item.declaration, ctx, true, false);
+        walkFunctionDecl(item.declaration, ctx, { type: "export-decl", index });
       } else if (item.declaration.type === "VariableDeclaration") {
-        walkVarDecl(item.declaration, ctx);
+        walkVarDecl(item.declaration, ctx, index, true);
       }
       break;
     case "ExportDefaultDeclaration":
       if (item.decl.type === "FunctionExpression") {
-        walkFunctionExpr(item.decl, ctx, "default", true, true);
+        walkFunctionExpr(item.decl, ctx, "default", {
+          type: "export-default",
+          index,
+        });
       }
       break;
     case "VariableDeclaration":
-      walkVarDecl(item, ctx);
+      walkVarDecl(item, ctx, index, false);
       break;
     default:
-      // Walk into statement bodies
       if ("body" in item && item.body) {
         walkStatement(item as Statement, ctx);
       }
   }
 }
 
-function walkVarDecl(decl: VariableDeclaration, ctx: WalkContext): void {
-  for (const d of decl.declarations) {
-    // Register the variable in current scope
+function walkVarDecl(
+  decl: VariableDeclaration,
+  ctx: WalkContext,
+  moduleIndex: number,
+  isExport: boolean
+): void {
+  for (let i = 0; i < decl.declarations.length; i++) {
+    const d = decl.declarations[i];
     if (d.id.type === "Identifier") {
       ctx.currentScope.declared.add(d.id.value);
     }
 
-    // Check if it's a function expression
     if (d.init) {
       if (
         d.init.type === "FunctionExpression" ||
         d.init.type === "ArrowFunctionExpression"
       ) {
         const name = d.id.type === "Identifier" ? d.id.value : "anonymous";
-        walkFunctionExpr(d.init, ctx, name, false, false);
+        const loc: AstLocation = isExport
+          ? { type: "export-var-declarator", moduleIndex, declIndex: i }
+          : { type: "var-declarator", moduleIndex, declIndex: i };
+        walkFunctionExpr(d.init, ctx, name, loc);
       } else {
         walkExpression(d.init, ctx);
       }
@@ -232,22 +323,19 @@ function walkVarDecl(decl: VariableDeclaration, ctx: WalkContext): void {
 function walkFunctionDecl(
   fn: FunctionDeclaration,
   ctx: WalkContext,
-  _isExport: boolean,
-  _isDefaultExport: boolean
+  astLocation: AstLocation
 ): void {
   const name = fn.identifier.value;
   ctx.currentScope.declared.add(name);
 
   if (!fn.body) return;
 
-  // Check for "use sandbox" directive
   const hasSandbox =
     fn.body.stmts.length > 0 && isUseSandboxDirective(fn.body.stmts[0]);
 
   if (hasSandbox) {
-    collectSandboxFunction(fn, fn.body, name, ctx);
+    collectSandboxFunction(fn, fn.body, name, ctx, astLocation);
   } else {
-    // Walk into function body with new scope
     walkFunctionBody(fn.body, fn.params, name, ctx);
   }
 }
@@ -256,13 +344,11 @@ function walkFunctionExpr(
   fn: FunctionExpression | ArrowFunctionExpression,
   ctx: WalkContext,
   name: string,
-  _isExport: boolean,
-  _isDefaultExport: boolean
+  astLocation: AstLocation
 ): void {
   const body = fn.body?.type === "BlockStatement" ? fn.body : null;
 
   if (!body) {
-    // Arrow with expression body - walk the expression
     if (
       fn.type === "ArrowFunctionExpression" &&
       fn.body?.type !== "BlockStatement"
@@ -272,14 +358,12 @@ function walkFunctionExpr(
     return;
   }
 
-  // Check for "use sandbox" directive
   const hasSandbox =
     body.stmts.length > 0 && isUseSandboxDirective(body.stmts[0]);
 
   if (hasSandbox) {
-    collectSandboxFunction(fn, body, name, ctx);
+    collectSandboxFunction(fn, body, name, ctx, astLocation);
   } else {
-    // Walk into function body with new scope
     walkFunctionBody(body, fn.params, name, ctx);
   }
 }
@@ -290,7 +374,6 @@ function walkFunctionBody(
   fnName: string,
   ctx: WalkContext
 ): void {
-  // Create new scope
   const newScope: ScopeInfo = {
     declared: new Set(extractParamNames(params)),
     parent: ctx.currentScope,
@@ -310,10 +393,20 @@ function walkFunctionBody(
 function walkStatement(stmt: Statement, ctx: WalkContext): void {
   switch (stmt.type) {
     case "VariableDeclaration":
-      walkVarDecl(stmt, ctx);
+      // Nested var decl - not tracking for replacement
+      for (const d of stmt.declarations) {
+        if (d.id.type === "Identifier") {
+          ctx.currentScope.declared.add(d.id.value);
+        }
+        if (d.init) walkExpression(d.init, ctx);
+      }
       break;
     case "FunctionDeclaration":
-      walkFunctionDecl(stmt, ctx, false, false);
+      // Nested function - not tracking for replacement yet
+      ctx.currentScope.declared.add(stmt.identifier.value);
+      if (stmt.body) {
+        walkFunctionBody(stmt.body, stmt.params, stmt.identifier.value, ctx);
+      }
       break;
     case "BlockStatement":
       for (const s of stmt.stmts) {
@@ -327,7 +420,12 @@ function walkStatement(stmt: Statement, ctx: WalkContext): void {
       break;
     case "ForStatement":
       if (stmt.init?.type === "VariableDeclaration") {
-        walkVarDecl(stmt.init, ctx);
+        for (const d of stmt.init.declarations) {
+          if (d.id.type === "Identifier") {
+            ctx.currentScope.declared.add(d.id.value);
+          }
+          if (d.init) walkExpression(d.init, ctx);
+        }
       }
       if (stmt.test) walkExpression(stmt.test, ctx);
       if (stmt.update) walkExpression(stmt.update, ctx);
@@ -348,7 +446,6 @@ function walkStatement(stmt: Statement, ctx: WalkContext): void {
       if (stmt.handler) walkStatement(stmt.handler.body, ctx);
       if (stmt.finalizer) walkStatement(stmt.finalizer, ctx);
       break;
-    // Add more as needed
   }
 }
 
@@ -356,14 +453,17 @@ function walkExpression(expr: Expression, ctx: WalkContext): void {
   switch (expr.type) {
     case "FunctionExpression":
     case "ArrowFunctionExpression":
+      // Nested function expressions - walk body but don't track for replacement
       const name =
         expr.type === "FunctionExpression" && expr.identifier
           ? expr.identifier.value
           : "anonymous";
-      walkFunctionExpr(expr, ctx, name, false, false);
+      const body = expr.body?.type === "BlockStatement" ? expr.body : null;
+      if (body) {
+        walkFunctionBody(body, expr.params, name, ctx);
+      }
       break;
     case "CallExpression":
-      // Callee could be Super or Import, skip those
       if (expr.callee.type !== "Super" && expr.callee.type !== "Import") {
         walkExpression(expr.callee, ctx);
       }
@@ -409,7 +509,6 @@ function walkExpression(expr: Expression, ctx: WalkContext): void {
         walkExpression(e, ctx);
       }
       break;
-    // Identifier doesn't need walking
   }
 }
 
@@ -417,82 +516,30 @@ function walkExpression(expr: Expression, ctx: WalkContext): void {
 // Sandbox Function Collection
 // ============================================================================
 
-/**
- * Extract the original parameter source text from a function.
- * This preserves destructuring patterns, type annotations, defaults, etc.
- */
-function getParamsSource(
-  params: (Param | Pattern)[],
-  source: string,
-  byteToChar: (pos: number) => number
-): string {
-  if (params.length === 0) return "";
-
-  // Get span from a param - prefer Param.span which includes type annotation
-  const getSpan = (p: Param | Pattern): { start: number; end: number } => {
-    const pAny = p as unknown as Record<string, unknown>;
-
-    // Param type has its own span that includes type annotation
-    if ("pat" in pAny && "span" in pAny) {
-      const span = pAny.span as { start: number; end: number };
-      return span;
-    }
-    // Fallback to pattern span (for arrow function params which are just patterns)
-    if ("pat" in pAny) {
-      const pat = pAny.pat as { span: { start: number; end: number } };
-      return pat.span;
-    }
-    // Pattern type directly
-    return (pAny as { span: { start: number; end: number } }).span;
-  };
-
-  const firstSpan = getSpan(params[0]);
-  const lastSpan = getSpan(params[params.length - 1]);
-
-  return source.slice(byteToChar(firstSpan.start), byteToChar(lastSpan.end));
-}
-
 function collectSandboxFunction(
   fn: AnyFunction,
   body: BlockStatement,
   name: string,
-  ctx: WalkContext
+  ctx: WalkContext,
+  astLocation: AstLocation
 ): void {
   const scopePath = [...ctx.scopePath, name];
   const isNested = ctx.scopePath.length > 0;
 
-  // Extract function parameter names (for closure detection)
   const paramNames = extractParamNames(fn.params);
+  const paramsSource = printParams(fn.params);
 
-  // Extract original parameter source (preserves destructuring, types, etc.)
-  const paramsSource = getParamsSource(fn.params, ctx.source, ctx.byteToChar);
-
-  // If nested, detect closure variables
   let closureVars: string[] = [];
   if (isNested) {
     closureVars = detectClosureVars(body, paramNames, ctx.currentScope);
   }
 
-  // Extract source positions
-  const fnStart = ctx.byteToChar(fn.span.start);
-  const fnEnd = ctx.byteToChar(fn.span.end);
+  const bodyStmts = body.stmts.slice(1);
+  const bodySource = bodyStmts.length > 0 ? printAst(bodyStmts) : "";
 
-  // Get the body source (after "use sandbox" directive)
-  const bodyStmts = body.stmts.slice(1); // Skip directive
-  let bodySource = "";
-  if (bodyStmts.length > 0) {
-    const firstStmt = bodyStmts[0];
-    const lastStmt = bodyStmts[bodyStmts.length - 1];
-    bodySource = ctx.source.slice(
-      ctx.byteToChar(firstStmt.span.start),
-      ctx.byteToChar(lastStmt.span.end)
-    );
-  }
+  // Use stable function ID based on file path + function name (not code content)
+  const fnId = generateFnId(ctx.filename, scopePath);
 
-  const fnId = generateFnId(scopePath, hashString(bodySource));
-
-  // Build the full function source for .sandbox.ts
-  // Use original params source to preserve destructuring patterns
   const closureParam = closureVars.length > 0 ? "__closure" : "";
   const allParams = closureParam
     ? closureParam + (paramsSource ? ", " + paramsSource : "")
@@ -512,17 +559,11 @@ function collectSandboxFunction(
     closureVars,
     bodySource,
     fullSource,
-    location: { start: fnStart, end: fnEnd },
     isAsync: "async" in fn ? fn.async : true,
+    astLocation,
   });
 }
 
-/**
- * Detect variables that are:
- * - Referenced in the function body
- * - Not declared in the function (not params, not local vars)
- * - Declared in a parent scope
- */
 function detectClosureVars(
   body: BlockStatement,
   params: string[],
@@ -531,13 +572,11 @@ function detectClosureVars(
   const referenced = new Set<string>();
   const locallyDeclared = new Set<string>(params);
 
-  // Simple recursive collector for identifiers
   function collectRefs(node: unknown): void {
     if (!node || typeof node !== "object") return;
 
     const n = node as Record<string, unknown>;
 
-    // Variable declaration
     if (n.type === "VariableDeclaration") {
       const decl = n as unknown as VariableDeclaration;
       for (const d of decl.declarations) {
@@ -549,14 +588,12 @@ function detectClosureVars(
       return;
     }
 
-    // Identifier reference
     if (n.type === "Identifier") {
       const id = n as unknown as Identifier;
       referenced.add(id.value);
       return;
     }
 
-    // Recurse into children
     for (const key of Object.keys(n)) {
       if (key === "span" || key === "type") continue;
       const val = n[key];
@@ -568,14 +605,10 @@ function detectClosureVars(
     }
   }
 
-  // Skip the "use sandbox" directive and collect from remaining statements
   for (const stmt of body.stmts.slice(1)) {
     collectRefs(stmt);
   }
 
-  // Filter: keep only those that are:
-  // 1. Referenced but not locally declared
-  // 2. AND exist in some parent scope
   const closureVars: string[] = [];
   for (const name of referenced) {
     if (locallyDeclared.has(name)) continue;
@@ -598,7 +631,6 @@ function isDeclaredInScope(name: string, scope: ScopeInfo | null): boolean {
 
 function isBuiltIn(name: string): boolean {
   const builtins = new Set([
-    // Globals
     "undefined",
     "null",
     "true",
@@ -614,7 +646,6 @@ function isBuiltIn(name: string): boolean {
     "exports",
     "__dirname",
     "__filename",
-    // Common globals
     "Promise",
     "Object",
     "Array",
@@ -648,27 +679,53 @@ function isBuiltIn(name: string): boolean {
 }
 
 // ============================================================================
-// Code Generation
+// AST Mutation & Code Generation
 // ============================================================================
 
-function generateStub(fn: SandboxFunction): string {
+/**
+ * Parse a stub function into an AST FunctionDeclaration.
+ */
+function parseStubToAst(stubCode: string): FunctionDeclaration {
+  const module = parseSync(stubCode, { syntax: "ecmascript" });
+  const firstItem = module.body[0];
+  if (firstItem.type === "FunctionDeclaration") {
+    return firstItem;
+  }
+  throw new Error("Stub code did not produce a FunctionDeclaration");
+}
+
+/**
+ * Parse a stub arrow function into an AST ArrowFunctionExpression.
+ */
+function parseArrowStubToAst(stubCode: string): ArrowFunctionExpression {
+  // Wrap in a variable declaration to parse it
+  const wrappedCode = `const _ = ${stubCode};`;
+  const module = parseSync(wrappedCode, { syntax: "ecmascript" });
+  const firstItem = module.body[0];
+  if (firstItem.type === "VariableDeclaration") {
+    const init = firstItem.declarations[0].init;
+    if (init?.type === "ArrowFunctionExpression") {
+      return init;
+    }
+  }
+  throw new Error("Stub code did not produce an ArrowFunctionExpression");
+}
+
+function generateStubCode(fn: SandboxFunction): string {
   const { fnId, originalName, params, closureVars, isAsync, scopePath } = fn;
 
   const asyncKeyword = isAsync ? "async " : "";
   const paramList = params.join(", ");
   const argsArray = params.length > 0 ? `[${params.join(", ")}]` : "[]";
 
-  // For nested functions, we need to pass closure vars
   let closureArg = "";
   if (closureVars.length > 0) {
-    closureArg = `,\n    closureVars: { ${closureVars.join(", ")} }`;
+    closureArg = `, closureVars: { ${closureVars.join(", ")} }`;
   }
 
-  // Determine if this is top-level or nested
   const isTopLevel = scopePath.length === 1;
 
   if (isTopLevel) {
-    // Top-level function: replace the entire function
     return `${asyncKeyword}function ${originalName}(${paramList}) {
   return __sandbox_runSandboxFn({
     fnId: "${fnId}",
@@ -676,7 +733,6 @@ function generateStub(fn: SandboxFunction): string {
   });
 }`;
   } else {
-    // Nested function: just the expression
     return `(${paramList}) => __sandbox_runSandboxFn({
   fnId: "${fnId}",
   args: ${argsArray}${closureArg}
@@ -685,7 +741,83 @@ function generateStub(fn: SandboxFunction): string {
 }
 
 /**
- * Reconstruct an import statement from AST (handles multi-line imports properly).
+ * Apply AST mutations to replace sandbox functions with stubs.
+ */
+function applyAstMutations(
+  module: Module,
+  sandboxFunctions: SandboxFunction[]
+): void {
+  for (const fn of sandboxFunctions) {
+    // Only handle top-level functions for now
+    if (fn.scopePath.length !== 1) continue;
+
+    const stubCode = generateStubCode(fn);
+    const loc = fn.astLocation;
+
+    switch (loc.type) {
+      case "module-item": {
+        const stubAst = parseStubToAst(stubCode);
+        module.body[loc.index] = stubAst;
+        break;
+      }
+      case "export-decl": {
+        const stubAst = parseStubToAst(stubCode);
+        const exportItem = module.body[loc.index] as ExportDeclaration;
+        exportItem.declaration = stubAst;
+        break;
+      }
+      case "export-default": {
+        // For export default, we need to create a FunctionExpression stub
+        const wrappedStub = stubCode.replace(
+          /^async function \w+/,
+          "async function"
+        );
+        const stubModule = parseSync(
+          `export default ${wrappedStub.replace(
+            /^function/,
+            "async function"
+          )}`,
+          { syntax: "ecmascript" }
+        );
+        module.body[loc.index] = stubModule.body[0];
+        break;
+      }
+      case "var-declarator": {
+        const varDecl = module.body[loc.moduleIndex] as VariableDeclaration;
+        const stubArrow = parseArrowStubToAst(
+          `async (${fn.params.join(", ")}) => __sandbox_runSandboxFn({ fnId: "${
+            fn.fnId
+          }", args: [${fn.params.join(", ")}] })`
+        );
+        varDecl.declarations[loc.declIndex].init = stubArrow;
+        break;
+      }
+      case "export-var-declarator": {
+        const exportDecl = module.body[loc.moduleIndex] as ExportDeclaration;
+        const varDecl = exportDecl.declaration as VariableDeclaration;
+        const stubArrow = parseArrowStubToAst(
+          `async (${fn.params.join(", ")}) => __sandbox_runSandboxFn({ fnId: "${
+            fn.fnId
+          }", args: [${fn.params.join(", ")}] })`
+        );
+        varDecl.declarations[loc.declIndex].init = stubArrow;
+        break;
+      }
+    }
+  }
+}
+
+/**
+ * Add the runtime import to the module.
+ */
+function addRuntimeImport(module: Module): void {
+  const importCode = `import { __runSandboxFn as __sandbox_runSandboxFn } from "@use-sandbox/core/runtime";`;
+  const importModule = parseSync(importCode, { syntax: "ecmascript" });
+  module.body.unshift(importModule.body[0]);
+}
+
+/**
+ * Reconstruct an import statement from AST.
  */
 function reconstructImport(
   item: import("@swc/core").ImportDeclaration
@@ -732,37 +864,26 @@ function reconstructImport(
 }
 
 /**
- * Extract imports from AST for the sandbox file.
- *
- * We include ALL imports and let esbuild handle tree-shaking.
- * The only special case is @use-sandbox/core → rewrite to @use-sandbox/core/shell
- * to avoid bundling the runtime (which depends on @vercel/sandbox).
+ * Extract imports for the sandbox file.
  */
 function extractRelevantImports(module: Module): string[] {
   const imports: string[] = [];
 
   for (const item of module.body) {
     if (item.type === "ImportDeclaration") {
-      // Skip type-only imports (they don't exist at runtime)
       if (item.typeOnly) continue;
 
       const source = item.source.value;
 
-      // Special case: @use-sandbox/core needs to be rewritten to avoid bundling the runtime
-      // The runtime imports @vercel/sandbox which shouldn't be in the sandbox bundle
       if (source === "@use-sandbox/core") {
-        // Only rewrite $ to the shell subpath, skip other imports
         for (const spec of item.specifiers) {
           if (spec.type === "ImportSpecifier" && spec.local.value === "$") {
             imports.push(`import { $ } from "@use-sandbox/core/shell";`);
           }
-          // Other imports like defineSandbox, __runSandboxFn etc. are skipped
-          // because they're server-side only
         }
         continue;
       }
 
-      // Include everything else - let esbuild tree-shake what's not used
       imports.push(reconstructImport(item));
     }
   }
@@ -781,12 +902,10 @@ function generateSandboxFile(
     "",
   ];
 
-  // Extract imports using AST (handles multi-line imports properly)
   const imports = extractRelevantImports(module);
   lines.push(...imports);
   lines.push("");
 
-  // Add each function
   for (const fn of fns) {
     lines.push(fn.fullSource);
     lines.push("");
@@ -803,7 +922,6 @@ export async function transform(
   source: string,
   filename: string
 ): Promise<TransformResult> {
-  // Quick check
   if (!source.includes("use sandbox")) {
     return {
       code: source,
@@ -812,8 +930,6 @@ export async function transform(
       sandboxFileContent: null,
     };
   }
-
-  const byteToCharMap = createByteToCharMap(source);
 
   const module = await parse(source, {
     syntax:
@@ -824,27 +940,17 @@ export async function transform(
     jsx: filename.endsWith(".jsx"),
   });
 
-  // Detect base offset (SWC may use global positions)
-  let baseOffset = 0;
-  if (module.body.length > 0) {
-    const firstStart = module.body[0].span?.start ?? 1;
-    if (firstStart > byteToCharMap.length) {
-      baseOffset = firstStart - 1;
-    }
-  }
-
-  const byteToChar = (pos: number): number => {
-    const adjusted = pos - baseOffset;
-    if (adjusted < 0 || adjusted >= byteToCharMap.length) return 0;
-    return byteToCharMap[adjusted];
-  };
+  // Normalize filename to relative path for stable IDs across environments
+  const normalizedFilename = filename
+    .replace(/\\/g, "/")
+    .replace(/^.*?\/app\//, "app/")  // Keep from app/ onwards
+    .replace(/^.*?\/src\//, "src/"); // Or from src/ onwards
 
   const ctx: WalkContext = {
-    source,
-    byteToChar,
     currentScope: { declared: new Set(), parent: null },
     scopePath: [],
     sandboxFunctions: [],
+    filename: normalizedFilename,
   };
 
   walkModule(module, ctx);
@@ -858,37 +964,26 @@ export async function transform(
     };
   }
 
-  // Generate .sandbox.ts content
+  // Generate .sandbox.ts content BEFORE mutating the module
   const sandboxContent = generateSandboxFile(
     ctx.sandboxFunctions,
     filename,
     module
   );
 
-  // Generate transformed source with stubs
-  const replacements = ctx.sandboxFunctions
-    .filter((fn) => fn.scopePath.length === 1) // Only top-level for now
-    .map((fn) => ({
-      start: fn.location.start,
-      end: fn.location.end,
-      replacement: generateStub(fn),
-    }))
-    .sort((a, b) => b.start - a.start);
+  // Mutate the AST to replace sandbox functions with stubs
+  applyAstMutations(module, ctx.sandboxFunctions);
 
-  let result = source;
-  for (const { start, end, replacement } of replacements) {
-    result = result.slice(0, start) + replacement + result.slice(end);
-  }
+  // Add runtime import
+  addRuntimeImport(module);
 
-  // Add import
-  const importStmt = `import { __runSandboxFn as __sandbox_runSandboxFn } from "@use-sandbox/core/runtime";\n`;
-  result = importStmt + result;
+  // Print the mutated module to get the output code
+  const result = printSync(module, {});
 
-  // Compute sandbox file path
   const sandboxFilePath = filename.replace(/\.(tsx?|jsx?)$/, ".sandbox.ts");
 
   return {
-    code: result,
+    code: result.code,
     hasSandboxFunctions: true,
     sandboxFilePath,
     sandboxFileContent: sandboxContent,
